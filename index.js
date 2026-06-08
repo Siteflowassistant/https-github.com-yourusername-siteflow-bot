@@ -1,13 +1,37 @@
 const express = require('express');
 const twilio = require('twilio');
 const OpenAI = require('openai');
+const chrono = require('chrono-node');
 
 const app = express();
 app.use(express.urlencoded({ extended: false }));
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
 
 const userContexts = {};
+const reminders = [];
+
+// Check reminders every minute
+setInterval(async () => {
+  const now = new Date();
+  for (let i = reminders.length - 1; i >= 0; i--) {
+    const reminder = reminders[i];
+    if (now >= reminder.time) {
+      try {
+        await twilioClient.messages.create({
+          body: `Hey ${reminder.name} — don't forget: ${reminder.task}`,
+          from: process.env.TWILIO_PHONE_NUMBER,
+          to: reminder.phone
+        });
+        reminders.splice(i, 1);
+        console.log(`Reminder sent to ${reminder.phone}: ${reminder.task}`);
+      } catch (err) {
+        console.error('Failed to send reminder:', err);
+      }
+    }
+  }
+}, 60000);
 
 app.post('/sms', async (req, res) => {
   const userMessage = req.body.Body;
@@ -16,7 +40,7 @@ app.post('/sms', async (req, res) => {
 
   if (!userContexts[userPhone]) {
     userContexts[userPhone] = {
-      name: 'mate',
+      name: 'there',
       businessContext: 'A construction business owner in Australia.',
       history: []
     };
@@ -31,55 +55,13 @@ app.post('/sms', async (req, res) => {
 
   try {
     const response = await openai.chat.completions.create({
-      model: 'gpt-4',
+      model: 'gpt-4o-mini',
       messages: [
         {
           role: 'system',
           content: `You are Flow, an AI assistant built specifically for Australian construction business owners.
 
 Your personality:
-- Friendly and approachable but professional
-- You speak like a reliable tradie — clear, direct, no corporate jargon
-- Slightly humorous but never silly
-- You never say "I am an AI" or mention ChatGPT or OpenAI
-- You always refer to yourself as Flow
-- Keep replies short and practical — builders are busy
-- Always use Australian spelling and language
-
-Your job:
-- Help construction business owners stay organised
-- Remember tasks and set reminders
-- Follow up on important jobs
-- Reduce admin and mental load
-
-When a user mentions a task, deadline, or reminder:
-- Confirm it clearly and simply
-- Example: "No worries, I'll remind you tonight at 6pm"
-
-When you don't know something:
-- Be honest but helpful
-- Never make up information
-
-The user's name is ${user.name}.
-The user's business information: ${user.businessContext}`
-        },
-        ...user.history
-      ],
-      max_tokens: 200
-    });
-
-    const flowReply = response.choices[0].message.content;
-    user.history.push({ role: 'assistant', content: flowReply });
-    twiml.message(flowReply);
-
-  } catch (err) {
-    console.error(err);
-    twiml.message("Sorry mate, Flow's having a moment. Try again in a sec.");
-  }
-
-  res.writeHead(200, { 'Content-Type': 'text/xml' });
-  res.end(twiml.toString());
-});
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Flow is live on port ${PORT}`));
+- Friendly and professional
+- Clear and direct — no fluff, no filler
+- Never say "mate", "no worries
