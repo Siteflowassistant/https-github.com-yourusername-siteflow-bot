@@ -14,28 +14,25 @@ const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_A
 const userContexts = {};
 const reminders = [];
 
-const STEPS = ['welcome', 'name', 'trade', 'teamSize', 'taskManagement', 'state', 'workAreas', 'workHours', 'done'];
-
-function isCorrection(message) {
-  const phrases = ['sorry i meant', 'sorry, i meant', 'i meant', 'scratch that', 'no wait', 'wait no', 'oops i', 'ignore that', 'disregard that'];
-  const lower = message.toLowerCase();
-  return phrases.some(function(p) { return lower.includes(p); });
+function newUser() {
+  return {
+    name: '', trade: '', teamSize: '', taskManagement: '',
+    state: '', workAreas: '', workHours: '', finishTime: '',
+    businessContext: '', onboarded: false,
+    onboardingIndex: 0,
+    pendingReminderTask: '', history: []
+  };
 }
 
-function extractCorrection(message) {
-  const patterns = [
-    /sorry[,]?\s+i meant\s+(.+)/i,
-    /i meant\s+(.+)/i,
-    /scratch that[,]?\s+(.+)/i,
-    /no wait[,]?\s+(.+)/i,
-    /oops[,]?\s+(.+)/i,
-  ];
-  for (let i = 0; i < patterns.length; i++) {
-    const match = message.match(patterns[i]);
-    if (match) return match[1].trim();
-  }
-  return null;
-}
+const QUESTIONS = [
+  "G'day, I'm Flow — your SiteFlow AI assistant built for construction. To get started I need to ask a few quick questions so I can understand your business. What's your name?",
+  "What's your trade? For example: Builder, Carpenter, Electrician, Plumber, Landscaper, Roofer, or other.",
+  "How many people on your team including yourself?",
+  "How do you currently manage your tasks and reminders?",
+  "What state are you based in?",
+  "What areas do you mainly work in? For example: Northern suburbs, CBD, regional, or specific towns.",
+  "What are your normal work hours? For example: 7am to 5pm."
+];
 
 function extractWorkHours(workHours) {
   const match = workHours.match(/to\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm))/i);
@@ -52,7 +49,7 @@ function isVagueTime(message) {
 }
 
 function isProfileUpdate(message) {
-  const phrases = ['update my', 'change my', 'my trade is now', 'my team is now', 'i moved to', 'i now work in', 'my hours are now', 'my finish time is now', 'i am now a', 'update profile', 'change profile', 'edit my'];
+  const phrases = ['update my', 'change my', 'my trade is now', 'my team is now', 'i moved to', 'i now work in', 'my hours are now', 'update profile', 'change profile', 'edit my'];
   const lower = message.toLowerCase();
   return phrases.some(function(p) { return lower.includes(p); });
 }
@@ -92,28 +89,20 @@ function searchWeb(query) {
 
           if (encoding === 'gzip') {
             zlib.gunzip(buffer, function(err, decoded) {
-              if (err) { resolve('Could not decode search results.'); } else { processData(decoded); }
+              if (err) { resolve('Could not decode.'); } else { processData(decoded); }
             });
           } else if (encoding === 'deflate') {
             zlib.inflate(buffer, function(err, decoded) {
-              if (err) { resolve('Could not decode search results.'); } else { processData(decoded); }
+              if (err) { resolve('Could not decode.'); } else { processData(decoded); }
             });
           } else { processData(buffer); }
-        } catch (e) { resolve('Search unavailable right now.'); }
+        } catch (e) { resolve('Search unavailable.'); }
       });
     });
 
-    req.on('error', function(err) { resolve('Search unavailable right now.'); });
+    req.on('error', function() { resolve('Search unavailable.'); });
     req.end();
   });
-}
-
-function newUser() {
-  return {
-    name: '', trade: '', teamSize: '', taskManagement: '',
-    state: '', workAreas: '', workHours: '', finishTime: '',
-    businessContext: '', step: 'welcome', pendingReminderTask: '', history: []
-  };
 }
 
 setInterval(async function() {
@@ -128,8 +117,8 @@ setInterval(async function() {
           to: reminder.phone
         });
         reminders.splice(i, 1);
-        console.log("Reminder sent to " + reminder.phone + ": " + reminder.task);
-      } catch (err) { console.error('Failed to send reminder:', err); }
+        console.log("Reminder sent: " + reminder.task);
+      } catch (err) { console.error('Reminder failed:', err); }
     }
   }
 }, 60000);
@@ -153,94 +142,36 @@ app.post('/sms', async function(req, res) {
     return;
   }
 
-  if (user.step !== 'done') {
-    let reply = '';
+  if (!user.onboarded) {
+    const idx = user.onboardingIndex;
 
-    if (user.step === 'welcome') {
-      user.step = 'name';
-      reply = "G'day, I'm Flow — your SiteFlow AI assistant built for construction. To get started, I'll need to ask you a few quick questions so I can understand your business and work the way you do. What's your name?";
-
-    } else if (user.step === 'name') {
-      if (user.name === '') {
-        user.name = userMessage;
-        user.step = 'trade';
-        reply = "Good to meet you " + user.name + ". What's your trade? For example: Builder, Carpenter, Electrician, Plumber, Landscaper, Roofer, or other.";
-      } else {
-        user.name = userMessage;
-        user.step = 'trade';
-        reply = "Good to meet you " + user.name + ". What's your trade? For example: Builder, Carpenter, Electrician, Plumber, Landscaper, Roofer, or other.";
-      }
-
-    } else if (user.step === 'trade') {
-      if (isCorrection(userMessage) && userMessage.length > 6) {
-        const corrected = extractCorrection(userMessage);
-        if (corrected) { user.name = corrected; reply = "Updated. What's your trade?"; }
-        else { user.step = 'name'; reply = "No problem — what's your name?"; }
-      } else {
-        user.trade = userMessage;
-        user.step = 'teamSize';
-        reply = "Got it. How many people on your team including yourself?";
-      }
-
-    } else if (user.step === 'teamSize') {
-      if (isCorrection(userMessage) && userMessage.length > 6) {
-        const corrected = extractCorrection(userMessage);
-        if (corrected) { user.trade = corrected; reply = "Updated. How many people on your team?"; }
-        else { user.step = 'trade'; reply = "No problem — what's your trade?"; }
-      } else {
-        user.teamSize = userMessage;
-        user.step = 'taskManagement';
-        reply = "How do you currently manage your tasks and reminders?";
-      }
-
-    } else if (user.step === 'taskManagement') {
-      if (isCorrection(userMessage) && userMessage.length > 6) {
-        const corrected = extractCorrection(userMessage);
-        if (corrected) { user.teamSize = corrected; reply = "Updated. How do you currently manage tasks?"; }
-        else { user.step = 'teamSize'; reply = "No problem — how many on your team?"; }
-      } else {
-        user.taskManagement = userMessage;
-        user.step = 'state';
-        reply = "What state are you based in?";
-      }
-
-    } else if (user.step === 'state') {
-      if (isCorrection(userMessage) && userMessage.length > 6) {
-        const corrected = extractCorrection(userMessage);
-        if (corrected) { user.taskManagement = corrected; reply = "Updated. What state are you based in?"; }
-        else { user.step = 'taskManagement'; reply = "No problem — how do you manage your tasks?"; }
-      } else {
-        user.state = userMessage;
-        user.step = 'workAreas';
-        reply = "What areas do you mainly work in? For example: Northern suburbs, CBD, regional, or specific towns.";
-      }
-
-    } else if (user.step === 'workAreas') {
-      if (isCorrection(userMessage) && userMessage.length > 6) {
-        const corrected = extractCorrection(userMessage);
-        if (corrected) { user.state = corrected; reply = "Updated. What areas do you mainly work in?"; }
-        else { user.step = 'state'; reply = "No problem — what state are you based in?"; }
-      } else {
-        user.workAreas = userMessage;
-        user.step = 'workHours';
-        reply = "What are your normal work hours? For example: 7am to 5pm.";
-      }
-
-    } else if (user.step === 'workHours') {
-      if (isCorrection(userMessage) && userMessage.length > 6) {
-        const corrected = extractCorrection(userMessage);
-        if (corrected) { user.workAreas = corrected; reply = "Updated. What are your normal work hours?"; }
-        else { user.step = 'workAreas'; reply = "No problem — what areas do you mainly work in?"; }
-      } else {
-        user.workHours = userMessage;
-        user.finishTime = extractWorkHours(userMessage);
-        user.step = 'done';
-        user.businessContext = user.name + " is a " + user.trade + " based in " + user.state + ", mainly working in " + user.workAreas + ". Team size: " + user.teamSize + ". Work hours: " + user.workHours + ". Finish time: " + user.finishTime + ". Currently manages tasks by: " + user.taskManagement + ".";
-        reply = "All set " + user.name + ". Tell me what needs doing.";
-      }
+    if (idx === 0) {
+      user.onboardingIndex = 1;
+      twiml.message(QUESTIONS[0]);
+      res.writeHead(200, { 'Content-Type': 'text/xml' });
+      res.end(twiml.toString());
+      return;
     }
 
-    twiml.message(reply);
+    if (idx === 1) { user.name = userMessage; }
+    else if (idx === 2) { user.trade = userMessage; }
+    else if (idx === 3) { user.teamSize = userMessage; }
+    else if (idx === 4) { user.taskManagement = userMessage; }
+    else if (idx === 5) { user.state = userMessage; }
+    else if (idx === 6) { user.workAreas = userMessage; }
+    else if (idx === 7) {
+      user.workHours = userMessage;
+      user.finishTime = extractWorkHours(userMessage);
+      user.onboarded = true;
+      user.businessContext = user.name + " is a " + user.trade + " based in " + user.state + ", mainly working in " + user.workAreas + ". Team size: " + user.teamSize + ". Work hours: " + user.workHours + ". Finish time: " + user.finishTime + ". Currently manages tasks by: " + user.taskManagement + ".";
+      twiml.message("All set " + user.name + ". Tell me what needs doing.");
+      res.writeHead(200, { 'Content-Type': 'text/xml' });
+      res.end(twiml.toString());
+      return;
+    }
+
+    user.onboardingIndex = idx + 1;
+    twiml.message(QUESTIONS[idx]);
     res.writeHead(200, { 'Content-Type': 'text/xml' });
     res.end(twiml.toString());
     return;
@@ -257,8 +188,8 @@ app.post('/sms', async function(req, res) {
       console.log("Reminder set: " + task + " for " + parsedTime);
       twiml.message("Locked in. I'll remind you to " + task + " at " + parsedTime.toLocaleTimeString('en-AU', { hour: '2-digit', minute: '2-digit', timeZone: 'Australia/Adelaide' }) + ".");
     } else {
-      twiml.message("I didn't catch that time. What time exactly?");
       user.pendingReminderTask = task;
+      twiml.message("I didn't catch that time. What time exactly?");
     }
 
     res.writeHead(200, { 'Content-Type': 'text/xml' });
@@ -336,14 +267,13 @@ app.post('/sms', async function(req, res) {
     if (shouldSearch) {
       const weatherKeywords = ['weather', 'rain', 'temperature', 'forecast', 'hot', 'cold', 'wind'];
       const isWeather = weatherKeywords.some(function(w) { return userMessage.toLowerCase().includes(w); });
-      let searchQuery = isWeather ? 'weather forecast ' + user.workAreas + ' ' + user.state + ' Australia today' : userMessage + ' Australia';
-      console.log('Searching web for: ' + searchQuery);
+      const searchQuery = isWeather ? 'weather forecast ' + user.workAreas + ' ' + user.state + ' Australia today' : userMessage + ' Australia';
+      console.log('Searching: ' + searchQuery);
       const searchResults = await searchWeb(searchQuery);
-      console.log('Search results: ' + searchResults.substring(0, 100));
       searchContext = '\n\nSEARCH RESULTS — you must use these to answer:\n' + searchResults;
     }
 
-    const systemPrompt = "You are Flow, an AI assistant built specifically for Australian construction business owners.\n\nRULES:\n- Professional and direct — no fluff\n- Never say you cannot access the internet\n- Never offer further help at the end of a message\n- Never end with a question unless you genuinely need information\n- Never mention ChatGPT or OpenAI\n- Always refer to yourself as Flow\n- Maximum three sentences per reply\n- Australian spelling and dollars\n- Always use the user's work areas and state for location based questions\n\nWhen search results are provided you MUST use them. Summarise clearly and give a practical recommendation.\n\nFor reminders with a clear specific time confirm in one sentence then add on a new line: REMINDER: [task] | [time]\n\nUser profile: " + user.businessContext + "\nUser name: " + user.name + "\nUser state: " + user.state + "\nUser work areas: " + user.workAreas + "\nUser work hours: " + user.workHours + "\nUser finish time: " + user.finishTime + "\nTime in Adelaide: " + new Date().toLocaleString('en-AU', { timeZone: 'Australia/Adelaide' }) + searchContext;
+    const systemPrompt = "You are Flow, an AI assistant built specifically for Australian construction business owners.\n\nRULES:\n- Professional and direct — no fluff\n- Never say you cannot access the internet\n- Never offer further help at the end of a message\n- Never end with a question unless you genuinely need information\n- Never mention ChatGPT or OpenAI\n- Always refer to yourself as Flow\n- Maximum three sentences per reply\n- Australian spelling and dollars\n- Always use the user's work areas and state for location based questions\n\nWhen search results are provided you MUST use them.\n\nFor reminders with a clear time confirm in one sentence then add: REMINDER: [task] | [time]\n\nUser profile: " + user.businessContext + "\nName: " + user.name + "\nState: " + user.state + "\nWork areas: " + user.workAreas + "\nWork hours: " + user.workHours + "\nFinish time: " + user.finishTime + "\nTime in Adelaide: " + new Date().toLocaleString('en-AU', { timeZone: 'Australia/Adelaide' }) + searchContext;
 
     const response = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
