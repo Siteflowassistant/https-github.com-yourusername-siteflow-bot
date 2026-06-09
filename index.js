@@ -194,6 +194,27 @@ app.post('/sms', async function(req, res) {
 
   const user = userContexts[userPhone];
 
+  if (userMessage === '86753099') {
+    userContexts[userPhone] = {
+      name: '',
+      trade: '',
+      teamSize: '',
+      taskManagement: '',
+      state: '',
+      workAreas: '',
+      workHours: '',
+      finishTime: '',
+      businessContext: '',
+      step: 0,
+      pendingReminderTask: '',
+      history: []
+    };
+    twiml.message("Profile reset. Starting fresh.");
+    res.writeHead(200, { 'Content-Type': 'text/xml' });
+    res.end(twiml.toString());
+    return;
+  }
+
   if (user.step < 8 || user.step === 0.5) {
     let reply = '';
 
