@@ -158,12 +158,18 @@ app.post('/sms', async function(req, res) {
 
     if (user.step === 'welcome') {
       user.step = 'name';
-      reply = "G'day, I'm Flow — your SiteFlow AI assistant built for construction. To get started, I'll need to ask you a few quick questions so I can understand your business and work the way you do. Ready to get started?";
+      reply = "G'day, I'm Flow — your SiteFlow AI assistant built for construction. To get started, I'll need to ask you a few quick questions so I can understand your business and work the way you do. What's your name?";
 
     } else if (user.step === 'name') {
-      user.name = userMessage;
-      user.step = 'trade';
-      reply = "What's your trade? For example: Builder, Carpenter, Electrician, Plumber, Landscaper, Roofer, or other.";
+      if (user.name === '') {
+        user.name = userMessage;
+        user.step = 'trade';
+        reply = "Good to meet you " + user.name + ". What's your trade? For example: Builder, Carpenter, Electrician, Plumber, Landscaper, Roofer, or other.";
+      } else {
+        user.name = userMessage;
+        user.step = 'trade';
+        reply = "Good to meet you " + user.name + ". What's your trade? For example: Builder, Carpenter, Electrician, Plumber, Landscaper, Roofer, or other.";
+      }
 
     } else if (user.step === 'trade') {
       if (isCorrection(userMessage) && userMessage.length > 6) {
