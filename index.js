@@ -16,6 +16,8 @@ app.use(express.urlencoded({ extended: false }));
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
 
+const ADMIN_PHONE = process.env.ADMIN_PHONE;
+
 const QUESTIONS = [
   "G'day, I'm Flow — your SiteFlow AI assistant built for construction. To get started I need to ask a few quick questions so I can understand your business. What's your name?",
   "What's your trade? For example: Builder, Carpenter, Electrician, Plumber, Landscaper, Roofer, or other.",
@@ -31,9 +33,13 @@ function newUser() {
     name: '', trade: '', teamSize: '', taskManagement: '',
     state: '', workAreas: '', workHours: '', finishTime: '',
     businessContext: '', onboarded: false,
-    onboardingIndex: 0,
+    onboardingIndex: 0, accessGranted: false,
     pendingReminderTask: '', history: []
   };
+}
+
+function generateCode() {
+  return Math.floor(100000 + Math.random() * 900000).toString();
 }
 
 function extractWorkHours(workHours) {
@@ -147,6 +153,31 @@ async function markReminderSent(id) {
   await db.collection('reminders').doc(id).update({ sent: true });
 }
 
+async function saveAccessCode(phone, code) {
+  await db.collection('access_codes').doc(phone).set({
+    code: code,
+    phone: phone,
+    used: false,
+    createdAt: admin.firestore.Timestamp.now()
+  });
+}
+
+async function validateAccessCode(phone, code) {
+  const snapshot = await db.collection('access_codes').where('code', '==', code).where('used', '==', false).get();
+  if (snapshot.empty) return false;
+  let valid = false;
+  snapshot.forEach(function(doc) {
+    if (doc.data().phone === phone || doc.data().phone === 'any') {
+      valid = doc.id;
+    }
+  });
+  return valid;
+}
+
+async function markCodeUsed(docId) {
+  await db.collection('access_codes').doc(docId).update({ used: true });
+}
+
 setInterval(async function() {
   try {
     const now = new Date();
@@ -173,8 +204,6 @@ app.post('/sms', async function(req, res) {
   const userPhone = req.body.From;
   const twiml = new twilio.twiml.MessagingResponse();
 
-  let user = await getUser(userPhone);
-
   if (userMessage === '86753099') {
     await saveUser(userPhone, newUser());
     twiml.message("Profile reset. Starting fresh.");
@@ -183,9 +212,74 @@ app.post('/sms', async function(req, res) {
     return;
   }
 
+  if (userMessage.toUpperCase().startsWith('FLOWADMIN')) {
+    if (userPhone !== ADMIN_PHONE) {
+      twiml.message("Not authorised.");
+      res.writeHead(200, { 'Content-Type': 'text/xml' });
+      res.end(twiml.toString());
+      return;
+    }
+
+    const parts = userMessage.split(' ');
+    if (parts.length < 2) {
+      twiml.message("Format: FLOWADMIN [phone number]");
+      res.writeHead(200, { 'Content-Type': 'text/xml' });
+      res.end(twiml.toString());
+      return;
+    }
+
+    let clientPhone = parts[1].trim();
+    if (!clientPhone.startsWith('+')) {
+      clientPhone = '+61' + clientPhone.replace(/^0/, '');
+    }
+
+    const code = generateCode();
+    await saveAccessCode(clientPhone, code);
+
+    await twilioClient.messages.create({
+      body: "G'day, your SiteFlow access code is " + code + ". Text this number and enter your code to get started with Flow — your AI assistant built for construction.",
+      from: process.env.TWILIO_PHONE_NUMBER,
+      to: clientPhone
+    });
+
+    twiml.message("Access code " + code + " sent to " + clientPhone + ".");
+    res.writeHead(200, { 'Content-Type': 'text/xml' });
+    res.end(twiml.toString());
+    return;
+  }
+
+  let user = await getUser(userPhone);
+
+  if (!user.accessGranted) {
+    if (user.onboardingIndex === 0) {
+      user.onboardingIndex = -1;
+      await saveUser(userPhone, user);
+      twiml.message("Welcome to SiteFlow. Please enter your access code to get started.");
+      res.writeHead(200, { 'Content-Type': 'text/xml' });
+      res.end(twiml.toString());
+      return;
+    }
+
+    const codeDoc = await validateAccessCode(userPhone, userMessage.trim());
+    if (codeDoc) {
+      await markCodeUsed(codeDoc);
+      user.accessGranted = true;
+      user.onboardingIndex = 0;
+      await saveUser(userPhone, user);
+      twiml.message("Access granted. Let's get you set up.");
+      res.writeHead(200, { 'Content-Type': 'text/xml' });
+      res.end(twiml.toString());
+      return;
+    } else {
+      twiml.message("That code isn't valid. Check your code or visit siteflowassistant.com to sign up.");
+      res.writeHead(200, { 'Content-Type': 'text/xml' });
+      res.end(twiml.toString());
+      return;
+    }
+  }
+
   if (!user.onboarded) {
     const idx = user.onboardingIndex;
-    console.log("Onboarding idx: " + idx + " message: " + userMessage);
 
     if (idx === 0) {
       user.onboardingIndex = 1;
@@ -236,7 +330,7 @@ app.post('/sms', async function(req, res) {
 
     if (parsedTime) {
       await saveReminder({ phone: userPhone, name: user.name, task: task, time: parsedTime });
-      console.log("Reminder saved to Firebase: " + task + " for " + parsedTime);
+      console.log("Reminder saved: " + task + " for " + parsedTime);
       twiml.message("Locked in. I'll remind you to " + task + " at " + parsedTime.toLocaleTimeString('en-AU', { hour: '2-digit', minute: '2-digit', timeZone: 'Australia/Adelaide' }) + ".");
     } else {
       user.pendingReminderTask = task;
