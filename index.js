@@ -14,6 +14,21 @@ const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_A
 const userContexts = {};
 const reminders = [];
 
+function resolveTimeShortcuts(message, finishTime) {
+  const finish = finishTime || '5:00pm';
+  return message
+    .replace(/after work/gi, 'at ' + finish)
+    .replace(/end of day/gi, 'at ' + finish)
+    .replace(/when i finish/gi, 'at ' + finish)
+    .replace(/when i get home/gi, 'at ' + finish)
+    .replace(/after i finish/gi, 'at ' + finish)
+    .replace(/lunchtime/gi, 'at 12:00pm')
+    .replace(/lunch time/gi, 'at 12:00pm')
+    .replace(/this morning/gi, 'at 8:00am')
+    .replace(/start of day/gi, 'at 7:00am')
+    .replace(/first thing/gi, 'at 7:00am');
+}
+
 function searchWeb(query) {
   return new Promise(function(resolve) {
     const encodedQuery = encodeURIComponent(query);
@@ -34,7 +49,7 @@ function searchWeb(query) {
         try {
           const buffer = Buffer.concat(chunks);
           const encoding = res.headers['content-encoding'];
-          
+
           function processData(data) {
             try {
               const parsed = JSON.parse(data.toString());
@@ -48,39 +63,30 @@ function searchWeb(query) {
               }).join('\n');
               resolve(summary);
             } catch (e) {
-              console.error('Parse error:', e.message);
               resolve('Could not parse search results.');
             }
           }
 
           if (encoding === 'gzip') {
             zlib.gunzip(buffer, function(err, decoded) {
-              if (err) {
-                resolve('Could not decode search results.');
-              } else {
-                processData(decoded);
-              }
+              if (err) { resolve('Could not decode search results.'); }
+              else { processData(decoded); }
             });
           } else if (encoding === 'deflate') {
             zlib.inflate(buffer, function(err, decoded) {
-              if (err) {
-                resolve('Could not decode search results.');
-              } else {
-                processData(decoded);
-              }
+              if (err) { resolve('Could not decode search results.'); }
+              else { processData(decoded); }
             });
           } else {
             processData(buffer);
           }
         } catch (e) {
-          console.error('Search error:', e.message);
           resolve('Search unavailable right now.');
         }
       });
     });
 
     req.on('error', function(err) {
-      console.error('Request error:', err.message);
       resolve('Search unavailable right now.');
     });
 
@@ -109,20 +115,82 @@ setInterval(async function() {
 }, 60000);
 
 app.post('/sms', async function(req, res) {
-  const userMessage = req.body.Body;
+  const userMessage = req.body.Body.trim();
   const userPhone = req.body.From;
   const twiml = new twilio.twiml.MessagingResponse();
 
   if (!userContexts[userPhone]) {
     userContexts[userPhone] = {
-      name: 'there',
-      businessContext: 'A construction business owner in Australia.',
+      name: '',
+      trade: '',
+      teamSize: '',
+      taskManagement: '',
+      state: '',
+      workAreas: '',
+      finishTime: '',
+      businessContext: '',
+      onboardingStep: 'name',
       history: []
     };
   }
 
   const user = userContexts[userPhone];
-  user.history.push({ role: 'user', content: userMessage });
+
+  if (user.onboardingStep !== 'complete') {
+    let reply = '';
+
+    if (user.onboardingStep === 'name') {
+      if (user.name === '') {
+        reply = "G'day, I'm Flow — your AI assistant for construction. Before we get started, what's your name?";
+        twiml.message(reply);
+        res.writeHead(200, { 'Content-Type': 'text/xml' });
+        res.end(twiml.toString());
+        return;
+      }
+      user.name = userMessage;
+      user.onboardingStep = 'trade';
+      reply = "Good to meet you " + user.name + ". What's your trade? For example: Builder, Carpenter, Electrician, Plumber, Landscaper, Roofer, or other.";
+
+    } else if (user.onboardingStep === 'trade') {
+      user.trade = userMessage;
+      user.onboardingStep = 'teamSize';
+      reply = "Got it. How many people on your team including yourself?";
+
+    } else if (user.onboardingStep === 'teamSize') {
+      user.teamSize = userMessage;
+      user.onboardingStep = 'taskManagement';
+      reply = "How do you currently manage your tasks and reminders?";
+
+    } else if (user.onboardingStep === 'taskManagement') {
+      user.taskManagement = userMessage;
+      user.onboardingStep = 'state';
+      reply = "What state are you based in?";
+
+    } else if (user.onboardingStep === 'state') {
+      user.state = userMessage;
+      user.onboardingStep = 'workAreas';
+      reply = "What areas do you mainly work in? For example: Northern suburbs, CBD, regional, or specific towns.";
+
+    } else if (user.onboardingStep === 'workAreas') {
+      user.workAreas = userMessage;
+      user.onboardingStep = 'finishTime';
+      reply = "What time do you usually finish work?";
+
+    } else if (user.onboardingStep === 'finishTime') {
+      user.finishTime = userMessage;
+      user.onboardingStep = 'complete';
+      user.businessContext = user.name + " is a " + user.trade + " based in " + user.state + ", mainly working in " + user.workAreas + ". Team size: " + user.teamSize + ". Finish time: " + user.finishTime + ". Currently manages tasks by: " + user.taskManagement + ".";
+      reply = "All set " + user.name + ". Tell me what needs doing.";
+    }
+
+    twiml.message(reply);
+    res.writeHead(200, { 'Content-Type': 'text/xml' });
+    res.end(twiml.toString());
+    return;
+  }
+
+  const resolvedMessage = resolveTimeShortcuts(userMessage, user.finishTime);
+  user.history.push({ role: 'user', content: resolvedMessage });
 
   if (user.history.length > 20) {
     user.history = user.history.slice(-20);
@@ -134,9 +202,9 @@ app.post('/sms', async function(req, res) {
       messages: [
         {
           role: 'system',
-          content: 'You decide if a message needs a web search to answer properly. Reply with only YES or NO. Reply YES if the message asks about prices, products, comparisons, current information, suppliers, availability, or anything that needs up to date information. Reply NO for reminders, general chat, or task management.'
+          content: 'You decide if a message needs a web search to answer properly. Reply with only YES or NO. Reply YES if the message asks about prices, products, comparisons, weather, current information, suppliers, availability, or anything that needs up to date information. Reply NO for reminders, general chat, or task management.'
         },
-        { role: 'user', content: userMessage }
+        { role: 'user', content: resolvedMessage }
       ],
       max_tokens: 5
     });
@@ -145,13 +213,19 @@ app.post('/sms', async function(req, res) {
     let searchContext = '';
 
     if (shouldSearch) {
-      console.log('Searching web for: ' + userMessage);
-      const searchResults = await searchWeb(userMessage + ' Australia price');
+      const weatherKeywords = ['weather', 'rain', 'temperature', 'forecast', 'hot', 'cold', 'wind'];
+      const isWeather = weatherKeywords.some(function(w) { return resolvedMessage.toLowerCase().includes(w); });
+      let searchQuery = resolvedMessage + ' Australia';
+      if (isWeather) {
+        searchQuery = 'weather forecast ' + user.workAreas + ' ' + user.state + ' Australia today';
+      }
+      console.log('Searching web for: ' + searchQuery);
+      const searchResults = await searchWeb(searchQuery);
       console.log('Search results: ' + searchResults.substring(0, 100));
       searchContext = '\n\nSEARCH RESULTS — you must use these to answer:\n' + searchResults;
     }
 
-    const systemPrompt = "You are Flow, an AI assistant built specifically for Australian construction business owners.\n\nRULES:\n- Professional and direct — no fluff\n- Never say you cannot access the internet — you have search results provided to you\n- Never say mate or offer further help at the end\n- Never mention ChatGPT or OpenAI\n- Always refer to yourself as Flow\n- Maximum three sentences per reply\n- Australian spelling and dollars\n\nWhen search results are provided at the bottom of this message you MUST use them. Summarise them clearly and give a practical recommendation.\n\nFor reminders confirm in one sentence then add on a new line: REMINDER: [task] | [time]\n\nBusiness info: " + user.businessContext + "\nTime in Adelaide: " + new Date().toLocaleString('en-AU', { timeZone: 'Australia/Adelaide' }) + searchContext;
+    const systemPrompt = "You are Flow, an AI assistant built specifically for Australian construction business owners.\n\nRULES:\n- Professional and direct — no fluff\n- Never say you cannot access the internet — you have search results provided to you\n- Never offer further help at the end of a message\n- Never end with a question unless you genuinely need information\n- Never mention ChatGPT or OpenAI\n- Always refer to yourself as Flow\n- Maximum three sentences per reply\n- Australian spelling and dollars\n- Always use the user's work areas and state for location based questions\n\nWhen search results are provided you MUST use them. Summarise clearly and give a practical recommendation.\n\nFor reminders confirm in one sentence then add on a new line: REMINDER: [task] | [time]\n\nUser profile: " + user.businessContext + "\nUser name: " + user.name + "\nUser state: " + user.state + "\nUser work areas: " + user.workAreas + "\nUser finish time: " + user.finishTime + "\nTime in Adelaide: " + new Date().toLocaleString('en-AU', { timeZone: 'Australia/Adelaide' }) + searchContext;
 
     const response = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
