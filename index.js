@@ -220,7 +220,7 @@ app.post('/sms', async function(req, res) {
     });
 
     await twilioClient.messages.create({
-      body: "G'day, your SiteFlow access code is " + code + ". Text this number and enter your code to get started with Flow — your AI assistant built for construction.",
+      body: "G'day, your SiteFlow access code is " + code + ". Save this number as a contact, then text us your code to get started with Flow — your AI assistant built for construction.",
       from: process.env.TWILIO_PHONE_NUMBER,
       to: clientPhone
     });
