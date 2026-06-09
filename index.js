@@ -129,7 +129,7 @@ app.post('/sms', async function(req, res) {
       workAreas: '',
       finishTime: '',
       businessContext: '',
-      onboardingStep: 'name',
+      onboardingStep: 'askName',
       history: []
     };
   }
@@ -139,46 +139,47 @@ app.post('/sms', async function(req, res) {
   if (user.onboardingStep !== 'complete') {
     let reply = '';
 
-    if (user.onboardingStep === 'name') {
-      if (user.name === '') {
-        reply = "G'day, I'm Flow — your AI assistant for construction. Before we get started, what's your name?";
-        twiml.message(reply);
-        res.writeHead(200, { 'Content-Type': 'text/xml' });
-        res.end(twiml.toString());
-        return;
-      }
+    if (user.onboardingStep === 'askName') {
+      user.onboardingStep = 'askTrade';
+      reply = "G'day, I'm Flow — your SiteFlow AI assistant for construction. Before we get started, what's your name?";
+      twiml.message(reply);
+      res.writeHead(200, { 'Content-Type': 'text/xml' });
+      res.end(twiml.toString());
+      return;
+    }
+
+    if (user.onboardingStep === 'askTrade') {
       user.name = userMessage;
-      user.onboardingStep = 'trade';
+      user.onboardingStep = 'askTeamSize';
       reply = "Good to meet you " + user.name + ". What's your trade? For example: Builder, Carpenter, Electrician, Plumber, Landscaper, Roofer, or other.";
 
-    } else if (user.onboardingStep === 'trade') {
+    } else if (user.onboardingStep === 'askTeamSize') {
       user.trade = userMessage;
-      user.onboardingStep = 'teamSize';
+      user.onboardingStep = 'askTaskManagement';
       reply = "Got it. How many people on your team including yourself?";
 
-    } else if (user.onboardingStep === 'teamSize') {
+    } else if (user.onboardingStep === 'askTaskManagement') {
       user.teamSize = userMessage;
-      user.onboardingStep = 'taskManagement';
+      user.onboardingStep = 'askState';
       reply = "How do you currently manage your tasks and reminders?";
 
-    } else if (user.onboardingStep === 'taskManagement') {
+    } else if (user.onboardingStep === 'askState') {
       user.taskManagement = userMessage;
-      user.onboardingStep = 'state';
+      user.onboardingStep = 'askWorkAreas';
       reply = "What state are you based in?";
 
-    } else if (user.onboardingStep === 'state') {
+    } else if (user.onboardingStep === 'askWorkAreas') {
       user.state = userMessage;
-      user.onboardingStep = 'workAreas';
+      user.onboardingStep = 'askFinishTime';
       reply = "What areas do you mainly work in? For example: Northern suburbs, CBD, regional, or specific towns.";
 
-    } else if (user.onboardingStep === 'workAreas') {
+    } else if (user.onboardingStep === 'askFinishTime') {
       user.workAreas = userMessage;
-      user.onboardingStep = 'finishTime';
+      user.onboardingStep = 'complete';
       reply = "What time do you usually finish work?";
 
-    } else if (user.onboardingStep === 'finishTime') {
+    } else if (user.onboardingStep === 'complete') {
       user.finishTime = userMessage;
-      user.onboardingStep = 'complete';
       user.businessContext = user.name + " is a " + user.trade + " based in " + user.state + ", mainly working in " + user.workAreas + ". Team size: " + user.teamSize + ". Finish time: " + user.finishTime + ". Currently manages tasks by: " + user.taskManagement + ".";
       reply = "All set " + user.name + ". Tell me what needs doing.";
     }
