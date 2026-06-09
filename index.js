@@ -14,6 +14,46 @@ const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_A
 const userContexts = {};
 const reminders = [];
 
+function isCorrection(message) {
+  const correctionPhrases = [
+    'sorry i meant', 'sorry, i meant', 'i meant', 'actually', 
+    'correction', 'wrong', 'not that', 'ignore that', 
+    'disregard', 'scratch that', 'no wait', 'wait no',
+    'sorry', 'oops', 'mistake'
+  ];
+  const lower = message.toLowerCase();
+  return correctionPhrases.some(function(p) { return lower.includes(p); });
+}
+
+function extractCorrection(message) {
+  const lower = message.toLowerCase();
+  const patterns = [
+    /sorry[,]?\s+i meant\s+(.+)/i,
+    /i meant\s+(.+)/i,
+    /actually\s+(.+)/i,
+    /correction[:\s]+(.+)/i,
+    /no wait[,]?\s+(.+)/i,
+    /wait[,]?\s+(.+)/i,
+    /oops[,]?\s+(.+)/i,
+  ];
+  for (let i = 0; i < patterns.length; i++) {
+    const match = message.match(patterns[i]);
+    if (match) return match[1].trim();
+  }
+  return null;
+}
+
+function getStepQuestion(step, name) {
+  if (step === 1) return "What's your name?";
+  if (step === 2) return "Good to meet you " + name + ". What's your trade? For example: Builder, Carpenter, Electrician, Plumber, Landscaper, Roofer, or other.";
+  if (step === 3) return "How many people on your team including yourself?";
+  if (step === 4) return "How do you currently manage your tasks and reminders?";
+  if (step === 5) return "What state are you based in?";
+  if (step === 6) return "What areas do you mainly work in? For example: Northern suburbs, CBD, regional, or specific towns.";
+  if (step === 7) return "What time do you usually finish work?";
+  return '';
+}
+
 function resolveTimeShortcuts(message, finishTime) {
   const finish = finishTime || '5:00pm';
   return message
@@ -138,6 +178,30 @@ app.post('/sms', async function(req, res) {
 
   if (user.step < 8) {
     let reply = '';
+
+    if (user.step > 0 && user.step < 8 && isCorrection(userMessage)) {
+      const correctedValue = extractCorrection(userMessage);
+      const prevStep = user.step - 1;
+
+      if (correctedValue) {
+        if (prevStep === 1) user.name = correctedValue;
+        else if (prevStep === 2) user.trade = correctedValue;
+        else if (prevStep === 3) user.teamSize = correctedValue;
+        else if (prevStep === 4) user.taskManagement = correctedValue;
+        else if (prevStep === 5) user.state = correctedValue;
+        else if (prevStep === 6) user.workAreas = correctedValue;
+        else if (prevStep === 7) user.finishTime = correctedValue;
+        reply = "Updated. " + getStepQuestion(user.step, user.name);
+      } else {
+        user.step = prevStep;
+        reply = "No problem — " + getStepQuestion(prevStep, user.name);
+      }
+
+      twiml.message(reply);
+      res.writeHead(200, { 'Content-Type': 'text/xml' });
+      res.end(twiml.toString());
+      return;
+    }
 
     if (user.step === 0) {
       user.step = 1;
