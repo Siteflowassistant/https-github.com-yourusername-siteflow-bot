@@ -129,57 +129,53 @@ app.post('/sms', async function(req, res) {
       workAreas: '',
       finishTime: '',
       businessContext: '',
-      onboardingStep: 'askName',
+      step: 0,
       history: []
     };
   }
 
   const user = userContexts[userPhone];
 
-  if (user.onboardingStep !== 'complete') {
+  if (user.step < 8) {
     let reply = '';
 
-    if (user.onboardingStep === 'askName') {
-      user.onboardingStep = 'askTrade';
+    if (user.step === 0) {
+      user.step = 1;
       reply = "G'day, I'm Flow — your SiteFlow AI assistant for construction. Before we get started, what's your name?";
-      twiml.message(reply);
-      res.writeHead(200, { 'Content-Type': 'text/xml' });
-      res.end(twiml.toString());
-      return;
-    }
 
-    if (user.onboardingStep === 'askTrade') {
+    } else if (user.step === 1) {
       user.name = userMessage;
-      user.onboardingStep = 'askTeamSize';
+      user.step = 2;
       reply = "Good to meet you " + user.name + ". What's your trade? For example: Builder, Carpenter, Electrician, Plumber, Landscaper, Roofer, or other.";
 
-    } else if (user.onboardingStep === 'askTeamSize') {
+    } else if (user.step === 2) {
       user.trade = userMessage;
-      user.onboardingStep = 'askTaskManagement';
+      user.step = 3;
       reply = "Got it. How many people on your team including yourself?";
 
-    } else if (user.onboardingStep === 'askTaskManagement') {
+    } else if (user.step === 3) {
       user.teamSize = userMessage;
-      user.onboardingStep = 'askState';
+      user.step = 4;
       reply = "How do you currently manage your tasks and reminders?";
 
-    } else if (user.onboardingStep === 'askState') {
+    } else if (user.step === 4) {
       user.taskManagement = userMessage;
-      user.onboardingStep = 'askWorkAreas';
+      user.step = 5;
       reply = "What state are you based in?";
 
-    } else if (user.onboardingStep === 'askWorkAreas') {
+    } else if (user.step === 5) {
       user.state = userMessage;
-      user.onboardingStep = 'askFinishTime';
+      user.step = 6;
       reply = "What areas do you mainly work in? For example: Northern suburbs, CBD, regional, or specific towns.";
 
-    } else if (user.onboardingStep === 'askFinishTime') {
+    } else if (user.step === 6) {
       user.workAreas = userMessage;
-      user.onboardingStep = 'complete';
+      user.step = 7;
       reply = "What time do you usually finish work?";
 
-    } else if (user.onboardingStep === 'complete') {
+    } else if (user.step === 7) {
       user.finishTime = userMessage;
+      user.step = 8;
       user.businessContext = user.name + " is a " + user.trade + " based in " + user.state + ", mainly working in " + user.workAreas + ". Team size: " + user.teamSize + ". Finish time: " + user.finishTime + ". Currently manages tasks by: " + user.taskManagement + ".";
       reply = "All set " + user.name + ". Tell me what needs doing.";
     }
