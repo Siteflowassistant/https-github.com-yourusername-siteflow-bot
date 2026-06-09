@@ -237,11 +237,15 @@ app.post('/sms', async function(req, res) {
     const codeDoc = await db.collection('access_codes').doc(userPhone).get();
     console.log("Code doc exists: " + codeDoc.exists + " entered: " + userMessage);
 
-    if (codeDoc.exists && codeDoc.data().code === userMessage.trim() && !codeDoc.data().used) {
-      await db.collection('access_codes').doc(userPhone).update({ used: true });
-      user.step = 'onboarding_1';
-      await saveUser(userPhone, user);
-      twiml.message("Access granted. G'day, I'm Flow — your SiteFlow AI assistant built for construction. To get started I need to ask a few quick questions so I can understand your business. What's your name?");
+    if (codeDoc.exists && codeDoc.data().code === userMessage.trim()) {
+      if (codeDoc.data().used) {
+        twiml.message("That code has already been used. Contact SiteFlow at siteflowassistant.com for a new code.");
+      } else {
+        await db.collection('access_codes').doc(userPhone).update({ used: true });
+        user.step = 'onboarding_1';
+        await saveUser(userPhone, user);
+        twiml.message("Access granted. G'day, I'm Flow — your SiteFlow AI assistant built for construction. To get started I need to ask a few quick questions so I can understand your business. What's your name?");
+      }
     } else {
       if (!codeDoc.exists) {
         twiml.message("Welcome to SiteFlow. Please enter your access code to get started.");
