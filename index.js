@@ -264,9 +264,9 @@ app.post('/sms', async function(req, res) {
     if (codeDoc) {
       await markCodeUsed(codeDoc);
       user.accessGranted = true;
-      user.onboardingIndex = 0;
+      user.onboardingIndex = 1;
       await saveUser(userPhone, user);
-      twiml.message("Access granted. Let's get you set up.");
+      twiml.message("Access granted. G'day, I'm Flow — your SiteFlow AI assistant built for construction. To get started I need to ask a few quick questions so I can understand your business. What's your name?");
       res.writeHead(200, { 'Content-Type': 'text/xml' });
       res.end(twiml.toString());
       return;
