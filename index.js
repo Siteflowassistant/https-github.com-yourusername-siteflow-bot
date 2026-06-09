@@ -144,6 +144,7 @@ app.post('/sms', async function(req, res) {
 
   if (!user.onboarded) {
     const idx = user.onboardingIndex;
+    console.log("Onboarding idx: " + idx + " message: " + userMessage);
 
     if (idx === 0) {
       user.onboardingIndex = 1;
