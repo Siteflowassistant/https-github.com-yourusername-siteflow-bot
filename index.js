@@ -179,7 +179,12 @@ app.post('/sms', async function(req, res) {
       user.onboarded = true;
       user.businessContext = user.name + " is a " + user.trade + " based in " + user.state + ", mainly working in " + user.workAreas + ". Team size: " + user.teamSize + ". Work hours: " + user.workHours + ". Finish time: " + user.finishTime + ". Currently manages tasks by: " + user.taskManagement + ".";
       await saveUser(userPhone, user);
-      twiml.message("All set " + user.name + ". Tell me what needs doing.");
+      await twilioClient.messages.create({
+        body: "Thanks " + user.name + ", that's everything I need. I'm ready to help keep your business moving.",
+        from: process.env.TWILIO_PHONE_NUMBER,
+        to: userPhone
+      });
+      twiml.message("One last thing — save this number as a contact. Name: SiteFlow, Last name: AI Assistant. That way you'll always know it's me.");
       res.writeHead(200, { 'Content-Type': 'text/xml' });
       res.end(twiml.toString());
       return;
