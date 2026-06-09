@@ -16,8 +16,6 @@ app.use(express.urlencoded({ extended: false }));
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
 
-const reminders = [];
-
 const QUESTIONS = [
   "G'day, I'm Flow — your SiteFlow AI assistant built for construction. To get started I need to ask a few quick questions so I can understand your business. What's your name?",
   "What's your trade? For example: Builder, Carpenter, Electrician, Plumber, Landscaper, Roofer, or other.",
@@ -111,9 +109,7 @@ function searchWeb(query) {
 
 async function getUser(phone) {
   const doc = await db.collection('users').doc(phone).get();
-  if (doc.exists) {
-    return doc.data();
-  }
+  if (doc.exists) return doc.data();
   return newUser();
 }
 
@@ -121,22 +117,55 @@ async function saveUser(phone, user) {
   await db.collection('users').doc(phone).set(user);
 }
 
+async function saveReminder(reminder) {
+  await db.collection('reminders').add({
+    phone: reminder.phone,
+    name: reminder.name,
+    task: reminder.task,
+    time: admin.firestore.Timestamp.fromDate(reminder.time),
+    sent: false
+  });
+}
+
+async function getPendingReminders() {
+  const snapshot = await db.collection('reminders').where('sent', '==', false).get();
+  const reminders = [];
+  snapshot.forEach(function(doc) {
+    const data = doc.data();
+    reminders.push({
+      id: doc.id,
+      phone: data.phone,
+      name: data.name,
+      task: data.task,
+      time: data.time.toDate()
+    });
+  });
+  return reminders;
+}
+
+async function markReminderSent(id) {
+  await db.collection('reminders').doc(id).update({ sent: true });
+}
+
 setInterval(async function() {
-  const now = new Date();
-  for (let i = reminders.length - 1; i >= 0; i--) {
-    const reminder = reminders[i];
-    if (now >= reminder.time) {
-      try {
-        await twilioClient.messages.create({
-          body: "Hey " + reminder.name + " — don't forget: " + reminder.task,
-          from: process.env.TWILIO_PHONE_NUMBER,
-          to: reminder.phone
-        });
-        reminders.splice(i, 1);
-        console.log("Reminder sent: " + reminder.task);
-      } catch (err) { console.error('Reminder failed:', err); }
+  try {
+    const now = new Date();
+    const reminders = await getPendingReminders();
+    for (let i = 0; i < reminders.length; i++) {
+      const reminder = reminders[i];
+      if (now >= reminder.time) {
+        try {
+          await twilioClient.messages.create({
+            body: "Hey " + reminder.name + " — don't forget: " + reminder.task,
+            from: process.env.TWILIO_PHONE_NUMBER,
+            to: reminder.phone
+          });
+          await markReminderSent(reminder.id);
+          console.log("Reminder sent: " + reminder.task);
+        } catch (err) { console.error('Reminder failed:', err); }
+      }
     }
-  }
+  } catch (err) { console.error('Reminder check failed:', err); }
 }, 60000);
 
 app.post('/sms', async function(req, res) {
@@ -206,8 +235,8 @@ app.post('/sms', async function(req, res) {
     const parsedTime = chrono.parseDate(userMessage, now, { forwardDate: true, timezone: 'Australia/Adelaide' });
 
     if (parsedTime) {
-      reminders.push({ phone: userPhone, name: user.name, task: task, time: parsedTime });
-      console.log("Reminder set: " + task + " for " + parsedTime);
+      await saveReminder({ phone: userPhone, name: user.name, task: task, time: parsedTime });
+      console.log("Reminder saved to Firebase: " + task + " for " + parsedTime);
       twiml.message("Locked in. I'll remind you to " + task + " at " + parsedTime.toLocaleTimeString('en-AU', { hour: '2-digit', minute: '2-digit', timeZone: 'Australia/Adelaide' }) + ".");
     } else {
       user.pendingReminderTask = task;
@@ -316,8 +345,8 @@ app.post('/sms', async function(req, res) {
       const now = new Date();
       const parsedTime = chrono.parseDate(timeText, now, { forwardDate: true, timezone: 'Australia/Adelaide' });
       if (parsedTime) {
-        reminders.push({ phone: userPhone, name: user.name, task: task, time: parsedTime });
-        console.log("Reminder set: " + task + " for " + parsedTime);
+        await saveReminder({ phone: userPhone, name: user.name, task: task, time: parsedTime });
+        console.log("Reminder saved: " + task + " for " + parsedTime);
       }
       flowReply = flowReply.replace(/\nREMINDER:.*$/m, '').trim();
     }
