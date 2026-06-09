@@ -194,7 +194,7 @@ app.post('/sms', async function(req, res) {
 
   const user = userContexts[userPhone];
 
-  if (user.step < 8) {
+  if (user.step < 8 || user.step === 0.5) {
     let reply = '';
 
     if (user.step > 0 && user.step < 8 && isCorrection(userMessage)) {
@@ -222,8 +222,11 @@ app.post('/sms', async function(req, res) {
     }
 
     if (user.step === 0) {
+      user.step = 0.5;
+      reply = "G'day, I'm Flow — your SiteFlow AI assistant built for construction. To get started, I'll need to ask you a few quick questions so I can understand your business and work the way you do. Ready to get started?";
+    } else if (user.step === 0.5) {
       user.step = 1;
-      reply = "G'day, I'm Flow — your SiteFlow AI assistant for construction. Before we get started, what's your name?";
+      reply = "What's your name?";
     } else if (user.step === 1) {
       user.name = userMessage;
       user.step = 2;
