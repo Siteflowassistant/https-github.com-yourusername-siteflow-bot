@@ -4,6 +4,11 @@ const OpenAI = require('openai');
 const chrono = require('chrono-node');
 const https = require('https');
 const zlib = require('zlib');
+const admin = require('firebase-admin');
+
+const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
+const db = admin.firestore();
 
 const app = express();
 app.use(express.urlencoded({ extended: false }));
@@ -11,18 +16,7 @@ app.use(express.urlencoded({ extended: false }));
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
 
-const userContexts = {};
 const reminders = [];
-
-function newUser() {
-  return {
-    name: '', trade: '', teamSize: '', taskManagement: '',
-    state: '', workAreas: '', workHours: '', finishTime: '',
-    businessContext: '', onboarded: false,
-    onboardingIndex: 0,
-    pendingReminderTask: '', history: []
-  };
-}
 
 const QUESTIONS = [
   "G'day, I'm Flow — your SiteFlow AI assistant built for construction. To get started I need to ask a few quick questions so I can understand your business. What's your name?",
@@ -33,6 +27,16 @@ const QUESTIONS = [
   "What areas do you mainly work in? For example: Northern suburbs, CBD, regional, or specific towns.",
   "What are your normal work hours? For example: 7am to 5pm."
 ];
+
+function newUser() {
+  return {
+    name: '', trade: '', teamSize: '', taskManagement: '',
+    state: '', workAreas: '', workHours: '', finishTime: '',
+    businessContext: '', onboarded: false,
+    onboardingIndex: 0,
+    pendingReminderTask: '', history: []
+  };
+}
 
 function extractWorkHours(workHours) {
   const match = workHours.match(/to\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm))/i);
@@ -105,6 +109,18 @@ function searchWeb(query) {
   });
 }
 
+async function getUser(phone) {
+  const doc = await db.collection('users').doc(phone).get();
+  if (doc.exists) {
+    return doc.data();
+  }
+  return newUser();
+}
+
+async function saveUser(phone, user) {
+  await db.collection('users').doc(phone).set(user);
+}
+
 setInterval(async function() {
   const now = new Date();
   for (let i = reminders.length - 1; i >= 0; i--) {
@@ -128,14 +144,10 @@ app.post('/sms', async function(req, res) {
   const userPhone = req.body.From;
   const twiml = new twilio.twiml.MessagingResponse();
 
-  if (!userContexts[userPhone]) {
-    userContexts[userPhone] = newUser();
-  }
-
-  const user = userContexts[userPhone];
+  let user = await getUser(userPhone);
 
   if (userMessage === '86753099') {
-    userContexts[userPhone] = newUser();
+    await saveUser(userPhone, newUser());
     twiml.message("Profile reset. Starting fresh.");
     res.writeHead(200, { 'Content-Type': 'text/xml' });
     res.end(twiml.toString());
@@ -148,6 +160,7 @@ app.post('/sms', async function(req, res) {
 
     if (idx === 0) {
       user.onboardingIndex = 1;
+      await saveUser(userPhone, user);
       twiml.message(QUESTIONS[0]);
       res.writeHead(200, { 'Content-Type': 'text/xml' });
       res.end(twiml.toString());
@@ -165,6 +178,7 @@ app.post('/sms', async function(req, res) {
       user.finishTime = extractWorkHours(userMessage);
       user.onboarded = true;
       user.businessContext = user.name + " is a " + user.trade + " based in " + user.state + ", mainly working in " + user.workAreas + ". Team size: " + user.teamSize + ". Work hours: " + user.workHours + ". Finish time: " + user.finishTime + ". Currently manages tasks by: " + user.taskManagement + ".";
+      await saveUser(userPhone, user);
       twiml.message("All set " + user.name + ". Tell me what needs doing.");
       res.writeHead(200, { 'Content-Type': 'text/xml' });
       res.end(twiml.toString());
@@ -172,6 +186,7 @@ app.post('/sms', async function(req, res) {
     }
 
     user.onboardingIndex = idx + 1;
+    await saveUser(userPhone, user);
     twiml.message(QUESTIONS[idx]);
     res.writeHead(200, { 'Content-Type': 'text/xml' });
     res.end(twiml.toString());
@@ -181,6 +196,7 @@ app.post('/sms', async function(req, res) {
   if (user.pendingReminderTask && user.pendingReminderTask !== '') {
     const task = user.pendingReminderTask;
     user.pendingReminderTask = '';
+    await saveUser(userPhone, user);
     const now = new Date();
     const parsedTime = chrono.parseDate(userMessage, now, { forwardDate: true, timezone: 'Australia/Adelaide' });
 
@@ -190,6 +206,7 @@ app.post('/sms', async function(req, res) {
       twiml.message("Locked in. I'll remind you to " + task + " at " + parsedTime.toLocaleTimeString('en-AU', { hour: '2-digit', minute: '2-digit', timeZone: 'Australia/Adelaide' }) + ".");
     } else {
       user.pendingReminderTask = task;
+      await saveUser(userPhone, user);
       twiml.message("I didn't catch that time. What time exactly?");
     }
 
@@ -226,6 +243,7 @@ app.post('/sms', async function(req, res) {
 
     if (updated) {
       user.businessContext = user.name + " is a " + user.trade + " based in " + user.state + ", mainly working in " + user.workAreas + ". Team size: " + user.teamSize + ". Work hours: " + user.workHours + ". Finish time: " + user.finishTime + ". Currently manages tasks by: " + user.taskManagement + ".";
+      await saveUser(userPhone, user);
       twiml.message("Updated your " + updatedField + ".");
     } else {
       twiml.message("What would you like to update? You can change your trade, team size, state, work areas, or work hours.");
@@ -243,12 +261,14 @@ app.post('/sms', async function(req, res) {
     const taskMatch = userMessage.match(/remind(?:er)?\s+(?:me\s+)?(?:to\s+)?(.+?)(?:\s+in the morning|\s+after work|\s+at night|\s+tonight|\s+this evening|\s+at lunch|\s+lunchtime|\s+first thing|\s+later|\s+sometime)/i);
     const task = taskMatch ? taskMatch[1].trim() : userMessage;
     user.pendingReminderTask = task;
+    await saveUser(userPhone, user);
     twiml.message("What time exactly?");
     res.writeHead(200, { 'Content-Type': 'text/xml' });
     res.end(twiml.toString());
     return;
   }
 
+  if (!user.history) user.history = [];
   user.history.push({ role: 'user', content: userMessage });
   if (user.history.length > 20) { user.history = user.history.slice(-20); }
 
@@ -298,6 +318,7 @@ app.post('/sms', async function(req, res) {
     }
 
     user.history.push({ role: 'assistant', content: flowReply });
+    await saveUser(userPhone, user);
     twiml.message(flowReply);
 
   } catch (err) {
