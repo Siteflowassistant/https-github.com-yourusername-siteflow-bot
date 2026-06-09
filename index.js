@@ -183,7 +183,7 @@ app.post('/sms', async function(req, res) {
 
   if (userMessage === '86753099') {
     await saveUser(userPhone, newUser());
-    twiml.message("Profile reset. Starting fresh.");
+    twiml.message("Profile reset. Text your access code to continue.");
     res.writeHead(200, { 'Content-Type': 'text/xml' });
     res.end(twiml.toString());
     return;
@@ -235,9 +235,17 @@ app.post('/sms', async function(req, res) {
 
   if (user.step === 'waitingCode') {
     const codeDoc = await db.collection('access_codes').doc(userPhone).get();
+
+    if (!codeDoc.exists) {
+      twiml.message("Welcome to SiteFlow. Please enter your access code to get started.");
+      res.writeHead(200, { 'Content-Type': 'text/xml' });
+      res.end(twiml.toString());
+      return;
+    }
+
     console.log("Code doc exists: " + codeDoc.exists + " entered: " + userMessage);
 
-    if (codeDoc.exists && codeDoc.data().code === userMessage.trim()) {
+    if (codeDoc.data().code === userMessage.trim()) {
       if (codeDoc.data().used) {
         twiml.message("That code has already been used. Contact SiteFlow at siteflowassistant.com for a new code.");
       } else {
@@ -247,11 +255,7 @@ app.post('/sms', async function(req, res) {
         twiml.message("Access granted. G'day, I'm Flow — your SiteFlow AI assistant built for construction. To get started I need to ask a few quick questions so I can understand your business. What's your name?");
       }
     } else {
-      if (!codeDoc.exists) {
-        twiml.message("Welcome to SiteFlow. Please enter your access code to get started.");
-      } else {
-        twiml.message("That code isn't valid. Check your code or visit siteflowassistant.com to sign up.");
-      }
+      twiml.message("That code isn't valid. Check your code or visit siteflowassistant.com to sign up.");
     }
 
     res.writeHead(200, { 'Content-Type': 'text/xml' });
