@@ -33,7 +33,8 @@ function newUser() {
     state: '', workAreas: '', workHours: '', finishTime: '',
     businessContext: '', onboarded: false,
     step: 'waitingCode',
-    pendingReminderTask: '', history: []
+    pendingReminderTask: '', history: [],
+    teamMembers: []
   };
 }
 
@@ -51,14 +52,12 @@ function extractWorkHours(workHours) {
 
 function isVagueTime(message) {
   const vagueTerms = ['in the morning', 'this morning', 'after work', 'end of day', 'when i finish', 'when i get home', 'at night', 'tonight', 'this evening', 'evening', 'at lunch', 'lunchtime', 'lunch time', 'first thing', 'start of day', 'later today', 'sometime today'];
-  const lower = message.toLowerCase();
-  return vagueTerms.some(function(t) { return lower.includes(t); });
+  return vagueTerms.some(function(t) { return message.toLowerCase().includes(t); });
 }
 
 function isProfileUpdate(message) {
   const phrases = ['update my', 'change my', 'my trade is now', 'my team is now', 'i moved to', 'i now work in', 'my hours are now', 'update profile', 'change profile', 'edit my'];
-  const lower = message.toLowerCase();
-  return phrases.some(function(p) { return lower.includes(p); });
+  return phrases.some(function(p) { return message.toLowerCase().includes(p); });
 }
 
 function searchWeb(query) {
@@ -68,10 +67,7 @@ function searchWeb(query) {
       hostname: 'api.search.brave.com',
       path: '/res/v1/web/search?q=' + encodedQuery + '&count=5',
       method: 'GET',
-      headers: {
-        'Accept': 'application/json',
-        'X-Subscription-Token': process.env.BRAVE_API_KEY
-      }
+      headers: { 'Accept': 'application/json', 'X-Subscription-Token': process.env.BRAVE_API_KEY }
     };
 
     const req = https.request(options, function(res) {
@@ -87,21 +83,14 @@ function searchWeb(query) {
               const parsed = JSON.parse(data.toString());
               const results = parsed.web && parsed.web.results ? parsed.web.results : [];
               if (results.length === 0) { resolve('No search results found.'); return; }
-              const summary = results.slice(0, 4).map(function(r) {
-                return r.title + ': ' + (r.description || '');
-              }).join('\n');
-              resolve(summary);
+              resolve(results.slice(0, 4).map(function(r) { return r.title + ': ' + (r.description || ''); }).join('\n'));
             } catch (e) { resolve('Could not parse search results.'); }
           }
 
           if (encoding === 'gzip') {
-            zlib.gunzip(buffer, function(err, decoded) {
-              if (err) { resolve('Could not decode.'); } else { processData(decoded); }
-            });
+            zlib.gunzip(buffer, function(err, decoded) { if (err) { resolve('Could not decode.'); } else { processData(decoded); } });
           } else if (encoding === 'deflate') {
-            zlib.inflate(buffer, function(err, decoded) {
-              if (err) { resolve('Could not decode.'); } else { processData(decoded); }
-            });
+            zlib.inflate(buffer, function(err, decoded) { if (err) { resolve('Could not decode.'); } else { processData(decoded); } });
           } else { processData(buffer); }
         } catch (e) { resolve('Search unavailable.'); }
       });
@@ -124,11 +113,8 @@ async function saveUser(phone, user) {
 
 async function saveReminder(reminder) {
   await db.collection('reminders').add({
-    phone: reminder.phone,
-    name: reminder.name,
-    task: reminder.task,
-    time: admin.firestore.Timestamp.fromDate(reminder.time),
-    sent: false
+    phone: reminder.phone, name: reminder.name, task: reminder.task,
+    time: admin.firestore.Timestamp.fromDate(reminder.time), sent: false
   });
 }
 
@@ -137,13 +123,7 @@ async function getPendingReminders() {
   const reminders = [];
   snapshot.forEach(function(doc) {
     const data = doc.data();
-    reminders.push({
-      id: doc.id,
-      phone: data.phone,
-      name: data.name,
-      task: data.task,
-      time: data.time.toDate()
-    });
+    reminders.push({ id: doc.id, phone: data.phone, name: data.name, task: data.task, time: data.time.toDate() });
   });
   return reminders;
 }
@@ -210,11 +190,8 @@ app.post('/sms', async function(req, res) {
     }
 
     const code = generateCode();
-
     await db.collection('access_codes').doc(clientPhone).set({
-      code: code,
-      phone: clientPhone,
-      used: false,
+      code: code, phone: clientPhone, used: false,
       createdAt: admin.firestore.Timestamp.now()
     });
 
@@ -234,17 +211,11 @@ app.post('/sms', async function(req, res) {
 
   if (user.step === 'waitingCode') {
     const codeDoc = await db.collection('access_codes').doc(userPhone).get();
+    console.log("Code check - exists: " + codeDoc.exists + " entered: " + userMessage);
 
     if (!codeDoc.exists) {
       twiml.message("Welcome to SiteFlow. Please enter your access code to get started.");
-      res.writeHead(200, { 'Content-Type': 'text/xml' });
-      res.end(twiml.toString());
-      return;
-    }
-
-    console.log("Code doc exists: " + codeDoc.exists + " entered: " + userMessage);
-
-    if (codeDoc.data().code === userMessage.trim()) {
+    } else if (codeDoc.data().code === userMessage.trim()) {
       if (codeDoc.data().used) {
         twiml.message("That code has already been used. Contact SiteFlow at siteflowassistant.com for a new code.");
       } else {
@@ -282,23 +253,19 @@ app.post('/sms', async function(req, res) {
       res.writeHead(200, { 'Content-Type': 'text/xml' });
       res.end(twiml.toString());
       return;
-    }
-
-    if (step === 'onboarding_8') {
-      await twilioClient.messages.create({
-        body: "Thanks " + user.name + ", that's everything I need. I'm ready to help keep your business moving.",
-        from: process.env.TWILIO_PHONE_NUMBER,
-        to: userPhone
-      });
-      user.step = 'done';
+    } else if (step === 'onboarding_8') {
       user.onboarded = true;
+      user.step = 'done';
       await saveUser(userPhone, user);
+      twiml.message("Thanks " + user.name + ", that's everything I need. I'm ready to help keep your business moving.");
+      res.writeHead(200, { 'Content-Type': 'text/xml' });
+      res.end(twiml.toString());
+      return;
+    }
 
     await saveUser(userPhone, user);
     const stepNum = parseInt(step.split('_')[1]);
-    if (stepNum <= 6) {
-      twiml.message(QUESTIONS[stepNum - 1]);
-    }
+    twiml.message(QUESTIONS[stepNum - 1]);
     res.writeHead(200, { 'Content-Type': 'text/xml' });
     res.end(twiml.toString());
     return;
@@ -404,7 +371,9 @@ app.post('/sms', async function(req, res) {
       searchContext = '\n\nSEARCH RESULTS — you must use these to answer:\n' + searchResults;
     }
 
-    const systemPrompt = "You are Flow, an AI assistant built specifically for Australian construction business owners.\n\nRULES:\n- Professional and direct — no fluff\n- Never say you cannot access the internet\n- Never offer further help at the end of a message\n- Never end with a question unless you genuinely need information\n- Never mention ChatGPT or OpenAI\n- Always refer to yourself as Flow\n- Maximum three sentences per reply\n- Australian spelling and dollars\n- Always use the user's work areas and state for location based questions\n\nWhen search results are provided you MUST use them.\n\nFor reminders with a clear time confirm in one sentence then add: REMINDER: [task] | [time]\n\nUser profile: " + user.businessContext + "\nName: " + user.name + "\nState: " + user.state + "\nWork areas: " + user.workAreas + "\nWork hours: " + user.workHours + "\nFinish time: " + user.finishTime + "\nTime in Adelaide: " + new Date().toLocaleString('en-AU', { timeZone: 'Australia/Adelaide' }) + searchContext;
+    const teamContext = user.teamMembers && user.teamMembers.length > 0 ? '\nTeam members: ' + JSON.stringify(user.teamMembers) : '';
+
+    const systemPrompt = "You are Flow, an AI assistant built specifically for Australian construction business owners.\n\nRULES:\n- Professional and direct — no fluff\n- Never say you cannot access the internet\n- Never offer further help at the end of a message\n- Never end with a question unless you genuinely need information\n- Never mention ChatGPT or OpenAI\n- Always refer to yourself as Flow\n- Maximum three sentences per reply\n- Australian spelling and dollars\n- Always use the user's work areas and state for location based questions\n\nWhen search results are provided you MUST use them.\n\nFor reminders with a clear time confirm in one sentence then add: REMINDER: [task] | [time]\n\nWhen the user mentions a person's name you don't recognise from the team list, after completing their request ask: 'Is [name] part of your team? I can keep track of them for you.'\n\nUser profile: " + user.businessContext + teamContext + "\nName: " + user.name + "\nState: " + user.state + "\nWork areas: " + user.workAreas + "\nWork hours: " + user.workHours + "\nFinish time: " + user.finishTime + "\nTime in Adelaide: " + new Date().toLocaleString('en-AU', { timeZone: 'Australia/Adelaide' }) + searchContext;
 
     const response = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
