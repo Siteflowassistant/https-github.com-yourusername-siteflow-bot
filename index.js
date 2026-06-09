@@ -3,6 +3,7 @@ const twilio = require('twilio');
 const OpenAI = require('openai');
 const chrono = require('chrono-node');
 const https = require('https');
+const zlib = require('zlib');
 
 const app = express();
 app.use(express.urlencoded({ extended: false }));
@@ -14,7 +15,7 @@ const userContexts = {};
 const reminders = [];
 
 function searchWeb(query) {
-  return new Promise(function(resolve, reject) {
+  return new Promise(function(resolve) {
     const encodedQuery = encodeURIComponent(query);
     const options = {
       hostname: 'api.search.brave.com',
@@ -22,29 +23,64 @@ function searchWeb(query) {
       method: 'GET',
       headers: {
         'Accept': 'application/json',
-        'Accept-Encoding': 'gzip',
         'X-Subscription-Token': process.env.BRAVE_API_KEY
       }
     };
 
     const req = https.request(options, function(res) {
-      let data = '';
-      res.on('data', function(chunk) { data += chunk; });
+      let chunks = [];
+      res.on('data', function(chunk) { chunks.push(chunk); });
       res.on('end', function() {
         try {
-          const parsed = JSON.parse(data);
-          const results = parsed.web && parsed.web.results ? parsed.web.results : [];
-          const summary = results.slice(0, 4).map(function(r) {
-            return r.title + ': ' + r.description;
-          }).join('\n');
-          resolve(summary || 'No results found.');
+          const buffer = Buffer.concat(chunks);
+          const encoding = res.headers['content-encoding'];
+          
+          function processData(data) {
+            try {
+              const parsed = JSON.parse(data.toString());
+              const results = parsed.web && parsed.web.results ? parsed.web.results : [];
+              if (results.length === 0) {
+                resolve('No search results found.');
+                return;
+              }
+              const summary = results.slice(0, 4).map(function(r) {
+                return r.title + ': ' + (r.description || '');
+              }).join('\n');
+              resolve(summary);
+            } catch (e) {
+              console.error('Parse error:', e.message);
+              resolve('Could not parse search results.');
+            }
+          }
+
+          if (encoding === 'gzip') {
+            zlib.gunzip(buffer, function(err, decoded) {
+              if (err) {
+                resolve('Could not decode search results.');
+              } else {
+                processData(decoded);
+              }
+            });
+          } else if (encoding === 'deflate') {
+            zlib.inflate(buffer, function(err, decoded) {
+              if (err) {
+                resolve('Could not decode search results.');
+              } else {
+                processData(decoded);
+              }
+            });
+          } else {
+            processData(buffer);
+          }
         } catch (e) {
-          resolve('Could not retrieve search results.');
+          console.error('Search error:', e.message);
+          resolve('Search unavailable right now.');
         }
       });
     });
 
     req.on('error', function(err) {
+      console.error('Request error:', err.message);
       resolve('Search unavailable right now.');
     });
 
@@ -98,7 +134,7 @@ app.post('/sms', async function(req, res) {
       messages: [
         {
           role: 'system',
-          content: 'You decide if a message needs a web search to answer properly. Reply with only YES or NO. Reply YES if the message asks about prices, products, comparisons, current information, suppliers, availability, news, or anything that needs up to date information. Reply NO for reminders, general chat, task management, or anything that does not need current data.'
+          content: 'You decide if a message needs a web search to answer properly. Reply with only YES or NO. Reply YES if the message asks about prices, products, comparisons, current information, suppliers, availability, or anything that needs up to date information. Reply NO for reminders, general chat, or task management.'
         },
         { role: 'user', content: userMessage }
       ],
@@ -110,12 +146,12 @@ app.post('/sms', async function(req, res) {
 
     if (shouldSearch) {
       console.log('Searching web for: ' + userMessage);
-      const searchResults = await searchWeb(userMessage + ' Australia');
-      searchContext = '\n\nSEARCH RESULTS (use these to answer the question directly):\n' + searchResults;
-      console.log('Search complete.');
+      const searchResults = await searchWeb(userMessage + ' Australia price');
+      console.log('Search results: ' + searchResults.substring(0, 100));
+      searchContext = '\n\nSEARCH RESULTS — you must use these to answer:\n' + searchResults;
     }
 
-    const systemPrompt = "You are Flow, an AI assistant built specifically for Australian construction business owners.\n\nYour personality:\n- Professional and direct\n- Clear and efficient — no fluff, no filler\n- Never say you cannot access the internet or search for information\n- Never say mate, no worries, or offer further help at the end of a message\n- Never end with a question unless you genuinely need information to complete a task\n- Never mention ChatGPT or OpenAI\n- Always refer to yourself as Flow\n- Keep replies concise — three sentences maximum\n- Use Australian spelling and dollars\n\nYour job:\n- Help construction business owners stay organised\n- Set reminders and follow through on them\n- Search for prices, products, and supplier information when asked\n- Reduce admin and mental load\n\nUSING SEARCH RESULTS:\n- When search results are provided at the bottom of this prompt you MUST use them to answer the question\n- Never ignore search results — they are real current data retrieved for you\n- Summarise the results in plain practical language\n- Use Australian dollars where possible\n- Give a clear recommendation if the data supports it\n\nWhen comparing prices or products give a direct practical summary and a recommendation.\n\nIMPORTANT — When the user asks for a reminder:\n- Confirm it in one short sentence\n- End your reply with this exact format on a new line: REMINDER: [task description] | [time description]\n- Example: REMINDER: Invoice David | tonight at 6pm\n\nWhen you do not know something be honest and brief. Never make up information.\n\nThe user's business information: " + user.businessContext + "\nCurrent date and time in Adelaide: " + new Date().toLocaleString('en-AU', { timeZone: 'Australia/Adelaide' }) + searchContext;
+    const systemPrompt = "You are Flow, an AI assistant built specifically for Australian construction business owners.\n\nRULES:\n- Professional and direct — no fluff\n- Never say you cannot access the internet — you have search results provided to you\n- Never say mate or offer further help at the end\n- Never mention ChatGPT or OpenAI\n- Always refer to yourself as Flow\n- Maximum three sentences per reply\n- Australian spelling and dollars\n\nWhen search results are provided at the bottom of this message you MUST use them. Summarise them clearly and give a practical recommendation.\n\nFor reminders confirm in one sentence then add on a new line: REMINDER: [task] | [time]\n\nBusiness info: " + user.businessContext + "\nTime in Adelaide: " + new Date().toLocaleString('en-AU', { timeZone: 'Australia/Adelaide' }) + searchContext;
 
     const response = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
@@ -141,7 +177,7 @@ app.post('/sms', async function(req, res) {
           task: task,
           time: parsedTime
         });
-        console.log("Reminder set: " + task + " for " + parsedTime + " to " + userPhone);
+        console.log("Reminder set: " + task + " for " + parsedTime);
       }
 
       flowReply = flowReply.replace(/\nREMINDER:.*$/m, '').trim();
