@@ -275,24 +275,30 @@ app.post('/sms', async function(req, res) {
     else if (step === 'onboarding_7') {
       user.workHours = userMessage;
       user.finishTime = extractWorkHours(userMessage);
-      user.onboarded = true;
-      user.step = 'done';
       user.businessContext = user.name + " is a " + user.trade + " based in " + user.state + ", mainly working in " + user.workAreas + ". Team size: " + user.teamSize + ". Work hours: " + user.workHours + ". Finish time: " + user.finishTime + ". Currently manages tasks by: " + user.taskManagement + ".";
+      user.step = 'onboarding_8';
       await saveUser(userPhone, user);
-      await twilioClient.messages.create({
-        body: "Thanks " + user.name + ", that's everything I need. I'm ready to help keep your business moving.",
-        from: process.env.TWILIO_PHONE_NUMBER,
-        to: userPhone
-      });
-      twiml.message("One last thing — save this number as a contact. Name: SiteFlow, Last name: AI Assistant. That way you'll always know it's me.");
+      twiml.message("One last thing — save this number as a contact. Name: SiteFlow, Last name: AI Assistant and set this as my profile picture. Let me know when you're done.");
       res.writeHead(200, { 'Content-Type': 'text/xml' });
       res.end(twiml.toString());
       return;
     }
 
+    if (step === 'onboarding_8') {
+      await twilioClient.messages.create({
+        body: "Thanks " + user.name + ", that's everything I need. I'm ready to help keep your business moving.",
+        from: process.env.TWILIO_PHONE_NUMBER,
+        to: userPhone
+      });
+      user.step = 'done';
+      user.onboarded = true;
+      await saveUser(userPhone, user);
+
     await saveUser(userPhone, user);
-    const qIndex = parseInt(step.split('_')[1]) - 1;
-    twiml.message(QUESTIONS[qIndex]);
+    const stepNum = parseInt(step.split('_')[1]);
+    if (stepNum <= 6) {
+      twiml.message(QUESTIONS[stepNum - 1]);
+    }
     res.writeHead(200, { 'Content-Type': 'text/xml' });
     res.end(twiml.toString());
     return;
