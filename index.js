@@ -19,7 +19,6 @@ const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_A
 const ADMIN_PHONE = process.env.ADMIN_PHONE;
 
 const QUESTIONS = [
-  "What's your name?",
   "What's your trade? For example: Builder, Carpenter, Electrician, Plumber, Landscaper, Roofer, or other.",
   "How many people on your team including yourself?",
   "How do you currently manage your tasks and reminders?",
