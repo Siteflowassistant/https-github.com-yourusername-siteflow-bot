@@ -38,7 +38,7 @@ function newUser() {
     name: '', trade: '', state: '', workAreas: '', workHours: '', finishTime: '',
     suppliers: '', adminHeadache: '',
     businessContext: '', onboarded: false,
-    step: 'waitingCode',
+    step: 'welcome',
     pendingReminderTask: '', history: [],
     teamMembers: []
   };
@@ -237,57 +237,12 @@ app.post('/sms', async function(req, res) {
       return reply();
     }
 
-    if (userMessage.toUpperCase().startsWith('FLOWADMIN')) {
-      if (userPhone !== ADMIN_PHONE) {
-        twiml.message("Not authorised.");
-        return reply();
-      }
-
-      const rawNumber = userMessage.slice(9).trim(); // everything after "FLOWADMIN"
-      if (!rawNumber) {
-        twiml.message("Format: FLOWADMIN [phone number]");
-        return reply();
-      }
-
-      const clientPhone = normalizeAuPhone(rawNumber);
-
-      const code = generateCode();
-      await db.collection('access_codes').doc(clientPhone).set({
-        code: code, phone: clientPhone, used: false,
-        createdAt: admin.firestore.Timestamp.now()
-      });
-
-      await twilioClient.messages.create({
-        body: "G'day, your SiteFlow access code is " + code + ". Save this number as a contact, then text us your code to get started with Flow — your AI assistant built for construction.",
-        from: process.env.TWILIO_PHONE_NUMBER,
-        to: clientPhone
-      });
-
-      twiml.message("Code " + code + " sent to " + clientPhone + ".");
-      return reply();
-    }
-
     let user = await getUser(userPhone);
 
-    if (user.step === 'waitingCode') {
-      const codeDoc = await db.collection('access_codes').doc(userPhone).get();
-      console.log("Code check - exists: " + codeDoc.exists + " entered: " + userMessage);
-
-      if (!codeDoc.exists) {
-        twiml.message("Welcome to SiteFlow. Enter your access code and we'll get you set up.");
-      } else if (codeDoc.data().code === userMessage.trim()) {
-        if (codeDoc.data().used) {
-          twiml.message("Looks like that code's already been used. Drop a message at siteflowassistant.com and we'll sort out a new one.");
-        } else {
-          await db.collection('access_codes').doc(userPhone).update({ used: true });
-          user.step = 'onboarding_1';
-          await saveUser(userPhone, user);
-          twiml.message("You're in. I'm Flow — think of me as the team member who remembers everything so you don't have to. A few quick questions so I get to know your business, then I'm ready to go. First up: what should I call you?");
-        }
-      } else {
-        twiml.message("That code isn't matching. Double-check it, or head to siteflowassistant.com to get set up.");
-      }
-
+    if (user.step === 'welcome' || user.step === 'waitingCode') {
+      user.step = 'onboarding_1';
+      await saveUser(userPhone, user);
+      twiml.message("G'day, I'm Flow — your SiteFlow AI assistant built for construction. Think of me as the team member who remembers everything so you don't have to. A few quick questions so I get to know your business, then I'm ready to go. First up: what should I call you?");
       return reply();
     }
 
