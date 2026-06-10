@@ -55,6 +55,19 @@ function generateCode() {
   return Math.floor(100000 + Math.random() * 900000).toString();
 }
 
+// Normalise however the admin types an Australian number into E.164 (+61...),
+// which is the format Twilio reports as the sender — so the access code is always
+// filed under the number the client will actually text from. Handles spaces,
+// dashes, brackets, a leading 0, and numbers already in +61 form.
+function normalizeAuPhone(raw) {
+  let p = (raw || '').replace(/[^\d+]/g, ''); // strip spaces, dashes, brackets
+  if (p.startsWith('+')) return p;            // already international
+  if (p.startsWith('0')) return '+61' + p.slice(1);
+  if (p.startsWith('61')) return '+' + p;
+  if (p.length === 9 && p.startsWith('4')) return '+61' + p;
+  return '+61' + p;
+}
+
 // ---- Reminder times are parsed in the USER's timezone (derived from their state)
 // so "5pm" means 5pm where they are, not 5pm on the server (UTC). ----
 
@@ -230,16 +243,13 @@ app.post('/sms', async function(req, res) {
         return reply();
       }
 
-      const parts = userMessage.split(' ');
-      if (parts.length < 2) {
+      const rawNumber = userMessage.slice(9).trim(); // everything after "FLOWADMIN"
+      if (!rawNumber) {
         twiml.message("Format: FLOWADMIN [phone number]");
         return reply();
       }
 
-      let clientPhone = parts[1].trim();
-      if (!clientPhone.startsWith('+')) {
-        clientPhone = '+61' + clientPhone.replace(/^0/, '');
-      }
+      const clientPhone = normalizeAuPhone(rawNumber);
 
       const code = generateCode();
       await db.collection('access_codes').doc(clientPhone).set({
