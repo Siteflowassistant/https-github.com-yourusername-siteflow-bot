@@ -30,7 +30,7 @@ const QUESTIONS = [
   "Where do you mainly work — particular suburbs, the CBD, regional, a few towns?",
   "What are your usual work hours and days? Something like 'Mon to Fri, 7 to 5' is all I need.",
   "Who are your go-to suppliers? Your timber yard, electrical wholesaler, hire place — whoever you order from regularly.",
-  "Last one: what's the bit of admin that bites you most — chasing invoices, ordering materials, following up quotes, or booking inspections?"
+  "What's the bit of admin that bites you most — chasing invoices, ordering materials, following up quotes, or booking inspections?"
 ];
 
 function newUser() {
