@@ -41,16 +41,24 @@ const CRISIS_PATTERNS = [
   /\bno reason to (live|go on)\b/, /\bcan'?t go on\b/, /\bend it all\b/
 ];
 
-// Onboarding questions, asked in order. Each answer is stored and fed into Flow's
-// context so he can actually use it (that's what sets him apart from generic AI).
-const QUESTIONS = [
-  "What's your trade? Builder, carpenter, electrician, plumber, landscaper, roofer - whatever you're known for on site.",
-  "Which state are you based in?",
-  "Where do you mainly work - particular suburbs, the CBD, regional, a few towns?",
-  "What are your usual work hours and days? Something like 'Mon to Fri, 7 to 5' is all I need.",
-  "Who are your go-to suppliers? Your timber yard, electrical wholesaler, hire place - whoever you order from regularly.",
-  "What's the bit of admin that bites you most - chasing invoices, ordering materials, following up quotes, or booking inspections?"
-];
+// Business details are now collected on the website during signup, NOT over SMS.
+// The website attaches them to the access code (see provisionFromProfile), so the
+// only SMS onboarding step left is "save me as a contact + photo".
+
+// Copy a website-supplied profile onto the user doc. `profile` is whatever the
+// website wrote to the access_codes doc under the `profile` field.
+function provisionFromProfile(user, profile) {
+  const p = profile || {};
+  user.name          = p.name || '';
+  user.trade         = p.trade || '';
+  user.state         = p.state || '';
+  user.workAreas     = p.workAreas || '';
+  user.workHours     = p.workHours || '';
+  user.finishTime    = p.workHours ? extractWorkHours(p.workHours) : '';
+  user.suppliers     = p.suppliers || '';
+  user.adminHeadache = p.adminHeadache || '';
+  user.businessContext = buildBusinessContext(user);
+}
 
 function newUser() {
   return {
@@ -320,13 +328,11 @@ setInterval(async function() {
   } catch (err) { console.error('Reminder check failed:', err); }
 }, 60000);
 
-// 2) Proactive check-ins - hourly. Only reaches out when there's a genuine
-// reason and only in daytime, max once per 5 days, and only if opted in.
+// 2) Proactive check-ins - hourly check, fires 3 times a week (Mon/Wed/Fri
+// mornings) in the user's local time, one per day, daytime only, opt-in only.
 setInterval(async function() {
   try {
-    const now = new Date();
-    const fiveDaysAgo = new Date(now - 5 * 24 * 60 * 60 * 1000);
-    const oneWeekAgo  = new Date(now - 7 * 24 * 60 * 60 * 1000);
+    const CHECKIN_DAYS = ['Mon', 'Wed', 'Fri']; // 3 times a week
 
     const snapshot = await db.collection('users')
       .where('onboarded', '==', true)
@@ -336,22 +342,31 @@ setInterval(async function() {
       const user = doc.data();
       const phone = doc.id;
 
-      if (!user.lastMessageAt) continue;
-      if (new Date(user.lastMessageAt) > fiveDaysAgo) continue;
-      if (user.lastProactiveAt && new Date(user.lastProactiveAt) > oneWeekAgo) continue;
       if (user.preferences && user.preferences.proactiveCheckins === false) continue;
 
       const wh = localWeekdayHour(tzForState(user.state));
-      if (wh.hour < 7 || wh.hour >= 18) continue;
+      if (CHECKIN_DAYS.indexOf(wh.weekday) === -1) continue; // only Mon/Wed/Fri
+      if (wh.hour < 7 || wh.hour >= 18) continue;            // daytime only
 
-      // Reason to reach out, based on what Flow does / doesn't know yet.
+      // At most one check-in per day (the hourly run would otherwise repeat).
+      if (user.lastProactiveAt && (Date.now() - new Date(user.lastProactiveAt).getTime()) < 20 * 60 * 60 * 1000) continue;
+      // Don't talk over an active conversation.
+      if (user.lastMessageAt && (Date.now() - new Date(user.lastMessageAt).getTime()) < 3 * 60 * 60 * 1000) continue;
+
+      // Reason to reach out. Fill knowledge gaps first, then rotate friendly
+      // nudges so three messages a week don't read as the same generic ping.
       let reason = '';
       if (!user.knowledge || !user.knowledge.suppliers || user.knowledge.suppliers.length === 0) {
         reason = "Do you have any go-to suppliers I should know about? It helps me keep an eye on prices and remind you about orders.";
       } else if (!user.knowledge || !user.knowledge.team || user.knowledge.team.length === 0) {
         reason = "Is there anyone on your crew I should know about? I can keep track of who's doing what on each job.";
       } else {
-        reason = "Anything on the go this week I should know about? Happy to take notes, set reminders, or just keep things moving.";
+        const nudges = [
+          "Anything on the go I should know about? Happy to take notes, set reminders, or chase something up.",
+          "How's the week shaping up? Sing out if there's a quote to follow, an order to place, or a reminder to set.",
+          "Need me to lock in any reminders or keep tabs on a job today? Just flick me a message."
+        ];
+        reason = nudges[Math.floor(Math.random() * nudges.length)];
       }
 
       try {
@@ -488,9 +503,17 @@ app.post('/sms', async function(req, res) {
         await db.collection('access_codes').doc(entered).update({
           used: true, usedBy: userPhone, usedAt: admin.firestore.Timestamp.now()
         });
-        user.step = 'onboarding_1';
+
+        // Pull the builder's details that the website attached to this code.
+        provisionFromProfile(user, codeDoc.data().profile);
+        user.step = 'save_contact';
         await saveUser(userPhone, user);
-        twiml.message("You're in. I'm Flow - your SiteFlow AI assistant built for construction. Think of me as the team member who remembers everything so you don't have to. A few quick questions so I get to know your business, then I'm ready to go. First up: what should I call you?");
+
+        // One combined welcome + save-contact message, with Flow's photo attached.
+        const intro = user.name ? ("You're in, " + user.name + " - ") : "You're in - ";
+        const contactMsg = twiml.message();
+        contactMsg.body(intro + "I'm Flow, your SiteFlow assistant built for construction. I've already got your business details from signup, so we're good to go. One quick thing first: save this number as 'SiteFlow' and add my photo if you like, so I'm easy to find. Give me a shout when that's done.");
+        if (FLOW_PHOTO_URL) { contactMsg.media(FLOW_PHOTO_URL); }
       } else if (codeDoc.exists) {
         twiml.message("That code's already been used. Reach out at siteflowassistant.com for a fresh one.");
       } else {
@@ -500,39 +523,14 @@ app.post('/sms', async function(req, res) {
       return reply();
     }
 
+    // The only SMS onboarding step left: the builder replies after saving the
+    // contact, and Flow finishes up. Their profile already came from the website.
     if (!user.onboarded) {
-      const step = user.step;
-      console.log("Onboarding step: " + step);
-
-      if (step === 'onboarding_1') { user.name = userMessage; user.step = 'onboarding_2'; }
-      else if (step === 'onboarding_2') { user.trade = userMessage; user.step = 'onboarding_3'; }
-      else if (step === 'onboarding_3') { user.state = userMessage; user.step = 'onboarding_4'; }
-      else if (step === 'onboarding_4') { user.workAreas = userMessage; user.step = 'onboarding_5'; }
-      else if (step === 'onboarding_5') { user.workHours = userMessage; user.finishTime = extractWorkHours(userMessage); user.step = 'onboarding_6'; }
-      else if (step === 'onboarding_6') { user.suppliers = userMessage; user.step = 'onboarding_7'; }
-      else if (step === 'onboarding_7') {
-        user.adminHeadache = userMessage;
-        user.businessContext = buildBusinessContext(user);
-        user.step = 'onboarding_8';
-        await saveUser(userPhone, user);
-
-        // Send the "save my photo" message WITH Flow's picture attached.
-        const contactMsg = twiml.message();
-        contactMsg.body("Nice one. One last thing before we start: save this number as 'SiteFlow' so I'm easy to find, and add my photo if you like. Let me know when you're done.");
-        if (FLOW_PHOTO_URL) { contactMsg.media(FLOW_PHOTO_URL); }
-
-        return reply();
-      } else if (step === 'onboarding_8') {
-        user.onboarded = true;
-        user.step = 'done';
-        await saveUser(userPhone, user);
-        twiml.message("Thanks " + user.name + " - that's everything I need. I've got your back from here. Whenever something needs doing, just tell me and I'll keep you on track.");
-        return reply();
-      }
-
+      user.onboarded = true;
+      user.step = 'done';
       await saveUser(userPhone, user);
-      const stepNum = parseInt(step.split('_')[1]);
-      twiml.message(QUESTIONS[stepNum - 1]);
+      const hi = user.name ? ("Thanks " + user.name + " - ") : "Thanks - ";
+      twiml.message(hi + "that's everything sorted. I've got your back from here. Whenever something needs doing, just tell me and I'll keep you on track.");
       return reply();
     }
 
