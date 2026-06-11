@@ -38,7 +38,7 @@ function newUser() {
     name: '', trade: '', state: '', workAreas: '', workHours: '', finishTime: '',
     suppliers: '', adminHeadache: '',
     businessContext: '', onboarded: false,
-    step: 'welcome',
+    step: 'waitingCode',
     pendingReminderTask: '', history: [],
     teamMembers: []
   };
@@ -237,12 +237,39 @@ app.post('/sms', async function(req, res) {
       return reply();
     }
 
+    if (userMessage.toUpperCase().startsWith('FLOWADMIN')) {
+      if (userPhone !== ADMIN_PHONE) {
+        twiml.message("Not authorised.");
+        return reply();
+      }
+      const code = generateCode();
+      await db.collection('access_codes').doc(code).set({
+        code: code, used: false, createdAt: admin.firestore.Timestamp.now()
+      });
+      twiml.message("New access code: " + code + " — give this to your customer. It works once, from any phone.");
+      return reply();
+    }
+
     let user = await getUser(userPhone);
 
-    if (user.step === 'welcome' || user.step === 'waitingCode') {
-      user.step = 'onboarding_1';
-      await saveUser(userPhone, user);
-      twiml.message("G'day, I'm Flow — your SiteFlow AI assistant built for construction. Think of me as the team member who remembers everything so you don't have to. A few quick questions so I get to know your business, then I'm ready to go. First up: what should I call you?");
+    if (user.step === 'waitingCode' || user.step === 'welcome') {
+      const entered = userMessage.trim();
+      const codeDoc = await db.collection('access_codes').doc(entered).get();
+      console.log("Code check - entered: " + entered + " exists: " + codeDoc.exists);
+
+      if (codeDoc.exists && codeDoc.data().used !== true) {
+        await db.collection('access_codes').doc(entered).update({
+          used: true, usedBy: userPhone, usedAt: admin.firestore.Timestamp.now()
+        });
+        user.step = 'onboarding_1';
+        await saveUser(userPhone, user);
+        twiml.message("You're in. I'm Flow — your SiteFlow AI assistant built for construction. Think of me as the team member who remembers everything so you don't have to. A few quick questions so I get to know your business, then I'm ready to go. First up: what should I call you?");
+      } else if (codeDoc.exists) {
+        twiml.message("That code's already been used. Reach out at siteflowassistant.com for a fresh one.");
+      } else {
+        twiml.message("To get started with Flow, text the access code you were given. If you don't have one yet, grab it from siteflowassistant.com.");
+      }
+
       return reply();
     }
 
