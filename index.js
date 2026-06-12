@@ -4,6 +4,7 @@ const OpenAI = require('openai');
 const chrono = require('chrono-node');
 const https = require('https');
 const zlib = require('zlib');
+const crypto = require('crypto');
 const admin = require('firebase-admin');
 
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
@@ -21,6 +22,18 @@ const ADMIN_PHONE = process.env.ADMIN_PHONE;
 // Public URL of Flow's photo, sent during onboarding so the user can save it as
 // the contact picture. Set this in your environment (see the setup guide).
 const FLOW_PHOTO_URL = process.env.FLOW_PHOTO_URL;
+
+// Public base URL of THIS server on Render, e.g. https://siteflow.onrender.com
+// Used to build OAuth redirect URIs and the connect links Flow texts.
+const APP_BASE_URL = (process.env.APP_BASE_URL || '').replace(/\/+$/, '');
+
+// Xero OAuth2 app credentials (create the app at https://developer.xero.com).
+// Register the redirect URI exactly as APP_BASE_URL + '/callback/xero'.
+const XERO_CLIENT_ID = process.env.XERO_CLIENT_ID;
+const XERO_CLIENT_SECRET = process.env.XERO_CLIENT_SECRET;
+const XERO_REDIRECT_URI = APP_BASE_URL + '/callback/xero';
+// Read-only scopes + offline_access so we get a refresh token.
+const XERO_SCOPES = 'openid profile email offline_access accounting.transactions.read accounting.reports.read accounting.contacts.read';
 
 // Keyword list that replaces the old "do I need to search?" LLM call.
 // Defined once at module level so it isn't rebuilt on every request.
@@ -80,12 +93,21 @@ function newUser() {
       team:      [],
       suppliers: [],
       clients:   [],
-      notes:     []
+      notes:     [],
+      leads:     []   // possible jobs/work mentioned in conversation, to chase up
     },
     // Timestamps used by the proactive + specials schedulers.
     lastMessageAt: null,
     lastProactiveAt: null,
-    lastSpecialsAt: null
+    lastSpecialsAt: null,
+    // First-week "getting to know you" flow.
+    signupAt: null,          // set when onboarding completes
+    firstWeekAsked: [],      // keys of questions already asked in week one
+    // Connected third-party accounts (OAuth). null until the builder connects.
+    integrations: {
+      xero: null,   // { tenantId, tenantName, accessToken, refreshToken, expiresAt, connectedAt }
+      gmail: null   // reserved for the Gmail integration (pending Google verification)
+    }
   };
 }
 
@@ -259,11 +281,15 @@ function backfillUser(user) {
     user.preferences = { weeklySpecials: true, proactiveCheckins: true, tenderAlerts: false, employeeSearch: true };
   }
   if (!user.knowledge) {
-    user.knowledge = { team: [], suppliers: [], clients: [], notes: [] };
+    user.knowledge = { team: [], suppliers: [], clients: [], notes: [], leads: [] };
   }
+  if (user.knowledge && !Array.isArray(user.knowledge.leads)) user.knowledge.leads = [];
   if (typeof user.lastMessageAt === 'undefined') user.lastMessageAt = null;
   if (typeof user.lastProactiveAt === 'undefined') user.lastProactiveAt = null;
   if (typeof user.lastSpecialsAt === 'undefined') user.lastSpecialsAt = null;
+  if (typeof user.signupAt === 'undefined') user.signupAt = null;
+  if (!Array.isArray(user.firstWeekAsked)) user.firstWeekAsked = [];
+  if (!user.integrations) user.integrations = { xero: null, gmail: null };
 }
 
 async function saveUser(phone, user) {
@@ -301,6 +327,187 @@ async function logFeatureRequest(phone, trade, request) {
   });
 }
 
+// ============================ INTEGRATIONS: XERO (read-only) ============================
+// Flow texts the builder a one-time connect link. They authorise in the browser,
+// Xero redirects back to /callback/xero, and we store their tokens + tenant id on
+// the user doc. After that, money questions over SMS hit the Xero API live.
+
+// Create a short-lived, single-use token that ties a connect link back to a phone.
+async function createConnectToken(phone, provider) {
+  const token = crypto.randomBytes(24).toString('hex');
+  await db.collection('connect_tokens').doc(token).set({
+    phone: phone,
+    provider: provider,
+    used: false,
+    createdAt: admin.firestore.Timestamp.now()
+  });
+  return token;
+}
+
+function xeroConfigured() {
+  return Boolean(XERO_CLIENT_ID && XERO_CLIENT_SECRET && APP_BASE_URL);
+}
+
+function xeroBasicAuth() {
+  return Buffer.from(XERO_CLIENT_ID + ':' + XERO_CLIENT_SECRET).toString('base64');
+}
+
+// Exchange an authorisation code (or refresh token) for a token set.
+async function xeroTokenRequest(params) {
+  const resp = await fetch('https://identity.xero.com/connect/token', {
+    method: 'POST',
+    headers: {
+      'Authorization': 'Basic ' + xeroBasicAuth(),
+      'Content-Type': 'application/x-www-form-urlencoded'
+    },
+    body: new URLSearchParams(params).toString()
+  });
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error('Xero token request failed: ' + resp.status + ' ' + text);
+  }
+  return resp.json();
+}
+
+// Ensure the stored access token is valid, refreshing it (and persisting the new
+// rotated refresh token) if it has expired. Returns the live access token.
+async function xeroEnsureToken(phone, user) {
+  const x = user.integrations && user.integrations.xero;
+  if (!x) throw new Error('Xero not connected');
+  const now = Date.now();
+  if (x.expiresAt && now < (x.expiresAt - 60000)) return x.accessToken; // still valid
+
+  const tok = await xeroTokenRequest({
+    grant_type: 'refresh_token',
+    refresh_token: x.refreshToken
+  });
+  x.accessToken = tok.access_token;
+  x.refreshToken = tok.refresh_token || x.refreshToken; // Xero rotates the refresh token
+  x.expiresAt = Date.now() + (tok.expires_in || 1800) * 1000;
+  user.integrations.xero = x;
+  await saveUser(phone, user);
+  return x.accessToken;
+}
+
+async function xeroGet(phone, user, apiPath) {
+  const accessToken = await xeroEnsureToken(phone, user);
+  const resp = await fetch('https://api.xero.com/api.xro/2.0/' + apiPath, {
+    headers: {
+      'Authorization': 'Bearer ' + accessToken,
+      'Xero-tenant-id': user.integrations.xero.tenantId,
+      'Accept': 'application/json'
+    }
+  });
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error('Xero API ' + apiPath + ' failed: ' + resp.status + ' ' + text);
+  }
+  return resp.json();
+}
+
+// Xero returns Microsoft JSON dates like "/Date(1719795600000+0000)/".
+function parseXeroDate(s) {
+  if (!s) return null;
+  const m = String(s).match(/\/Date\((\d+)/);
+  return m ? new Date(parseInt(m[1], 10)) : null;
+}
+
+function fmtAud(n) {
+  const v = Math.round((Number(n) || 0) * 100) / 100;
+  return '$' + v.toLocaleString('en-AU', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+// Build a short, SMS-friendly money summary from outstanding sales invoices.
+async function getXeroMoneySummary(phone, user) {
+  // ACCREC = money owed TO the builder. AUTHORISED = approved and awaiting payment.
+  const data = await xeroGet(phone, user, 'Invoices?where=' +
+    encodeURIComponent('Type=="ACCREC" AND Status=="AUTHORISED"'));
+  const invoices = (data && data.Invoices) ? data.Invoices : [];
+
+  let owed = 0, overdueTotal = 0, overdueCount = 0;
+  let oldest = null;
+  const now = new Date();
+
+  for (let i = 0; i < invoices.length; i++) {
+    const inv = invoices[i];
+    const due = Number(inv.AmountDue) || 0;
+    if (due <= 0) continue;
+    owed += due;
+    const dueDate = parseXeroDate(inv.DueDateString || inv.DueDate);
+    if (dueDate && dueDate < now) {
+      overdueTotal += due;
+      overdueCount += 1;
+      if (!oldest || dueDate < oldest.date) {
+        oldest = { date: dueDate, name: (inv.Contact && inv.Contact.Name) || 'a client', amount: due };
+      }
+    }
+  }
+
+  if (owed === 0) {
+    return "Your Xero's looking clean - no outstanding invoices owed to you right now.";
+  }
+
+  let msg = "You're owed " + fmtAud(owed) + " across outstanding invoices.";
+  if (overdueCount > 0) {
+    const days = oldest ? Math.floor((now - oldest.date) / 86400000) : 0;
+    msg += " " + overdueCount + (overdueCount === 1 ? " is overdue" : " are overdue") +
+      " (" + fmtAud(overdueTotal) + ")";
+    if (oldest) msg += ", oldest is " + oldest.name + " at " + days + " days";
+    msg += ".";
+  }
+  msg += " (Live from Xero just now.)";
+  return msg;
+}
+
+// Does this look like a "how's the money / invoices" question?
+function isMoneyQuery(message) {
+  const lower = (message || '').toLowerCase();
+  return /\b(cash ?flow|how'?s the money|how is the money|money looking|who owes|owe me|outstanding invoice|unpaid invoice|overdue|invoices? owed|get paid)\b/.test(lower);
+}
+
+function wantsXeroConnect(message) {
+  const lower = (message || '').toLowerCase();
+  return /\b(connect|link|hook up|set up|setup)\b/.test(lower) && /\bxero\b/.test(lower);
+}
+
+// "Any work going / find me leads / tenders near me"
+function wantsLeadSearch(message) {
+  const lower = (message || '').toLowerCase();
+  return /\b(work going|work available|any (new )?work|find (me )?(work|leads?|tenders?|new jobs?)|any (new )?leads?|tenders?|new jobs near|jobs going|whats around|what'?s around)\b/.test(lower);
+}
+
+// "Find me a labourer / help me hire / write a job ad"
+function wantsHiringHelp(message) {
+  const lower = (message || '').toLowerCase();
+  const role = /\b(labou?rer|apprentice|chippy|chippie|sparky|tradie|subbie|sub-?contractor|carpenter|plumber|worker|staff|employee|offsider)\b/.test(lower);
+  const hire = /\b(hire|hiring|find (me )?(a|an|some)|put on|take on|need (a|an|some|another)|looking for (a|an|some)|job ad|advertise (a|an|the))\b/.test(lower);
+  return (hire && role) || /\bjob ad\b/.test(lower);
+}
+
+// First-week "getting to know you" questions. Returns the next one not yet asked,
+// skipping anything Flow already knows (e.g. the name if it came from signup).
+function nextFirstWeekQuestion(user) {
+  const asked = Array.isArray(user.firstWeekAsked) ? user.firstWeekAsked : [];
+  const k = user.knowledge || {};
+  const candidates = [];
+  if (!user.name) {
+    candidates.push({ key: 'name', text: "I didn't catch your name - what should I call you?" });
+  }
+  if (!k.team || k.team.length === 0) {
+    candidates.push({ key: 'team', text: "Who's on your crew? Give me their names and what they do and I'll keep track of who's on what job." });
+  }
+  candidates.push({ key: 'currentwork', text: "What are you working on at the moment? I'll keep tabs on it and chase up anything that needs following." });
+  if (!k.clients || k.clients.length === 0) {
+    candidates.push({ key: 'clients', text: "Who are the main clients or builders you work for? Helps me keep your jobs straight." });
+  }
+  candidates.push({ key: 'rapport', text: "How long have you been running the show? Good to know who I'm working for." });
+
+  for (let i = 0; i < candidates.length; i++) {
+    if (asked.indexOf(candidates[i].key) === -1) return candidates[i];
+  }
+  return null;
+}
+
 // ============================ SCHEDULERS ============================
 // NOTE: these rely on the process staying awake. On a Render instance that
 // spins down when idle they will NOT run reliably - use an always-on instance
@@ -328,11 +535,13 @@ setInterval(async function() {
   } catch (err) { console.error('Reminder check failed:', err); }
 }, 60000);
 
-// 2) Proactive check-ins - hourly check, fires 3 times a week (Mon/Wed/Fri
-// mornings) in the user's local time, one per day, daytime only, opt-in only.
+// 2) Proactive check-ins - hourly. In a user's FIRST WEEK, Flow asks getting-to-
+// know-you questions on any day (great for re-engaging quiet new signups). After
+// that, it settles into 3 friendly check-ins a week (Mon/Wed/Fri). One per day,
+// daytime only, opt-in, and never on top of an active conversation.
 setInterval(async function() {
   try {
-    const CHECKIN_DAYS = ['Mon', 'Wed', 'Fri']; // 3 times a week
+    const CHECKIN_DAYS = ['Mon', 'Wed', 'Fri']; // 3 times a week, steady state
 
     const snapshot = await db.collection('users')
       .where('onboarded', '==', true)
@@ -345,37 +554,68 @@ setInterval(async function() {
       if (user.preferences && user.preferences.proactiveCheckins === false) continue;
 
       const wh = localWeekdayHour(tzForState(user.state));
-      if (CHECKIN_DAYS.indexOf(wh.weekday) === -1) continue; // only Mon/Wed/Fri
-      if (wh.hour < 7 || wh.hour >= 18) continue;            // daytime only
+      if (wh.hour < 7 || wh.hour >= 18) continue; // daytime only
 
-      // At most one check-in per day (the hourly run would otherwise repeat).
+      // At most one outreach per ~day (the hourly run would otherwise repeat).
       if (user.lastProactiveAt && (Date.now() - new Date(user.lastProactiveAt).getTime()) < 20 * 60 * 60 * 1000) continue;
       // Don't talk over an active conversation.
       if (user.lastMessageAt && (Date.now() - new Date(user.lastMessageAt).getTime()) < 3 * 60 * 60 * 1000) continue;
 
-      // Reason to reach out. Fill knowledge gaps first, then rotate friendly
-      // nudges so three messages a week don't read as the same generic ping.
-      let reason = '';
-      if (!user.knowledge || !user.knowledge.suppliers || user.knowledge.suppliers.length === 0) {
-        reason = "Do you have any go-to suppliers I should know about? It helps me keep an eye on prices and remind you about orders.";
-      } else if (!user.knowledge || !user.knowledge.team || user.knowledge.team.length === 0) {
-        reason = "Is there anyone on your crew I should know about? I can keep track of who's doing what on each job.";
-      } else {
-        const nudges = [
-          "Anything on the go I should know about? Happy to take notes, set reminders, or chase something up.",
-          "How's the week shaping up? Sing out if there's a quote to follow, an order to place, or a reminder to set.",
-          "Need me to lock in any reminders or keep tabs on a job today? Just flick me a message."
-        ];
-        reason = nudges[Math.floor(Math.random() * nudges.length)];
+      let body = null;
+      const upd = { lastProactiveAt: new Date().toISOString() };
+
+      // ---- First week: getting-to-know-you question (any day) ----
+      const inFirstWeek = user.signupAt &&
+        (Date.now() - new Date(user.signupAt).getTime()) < 7 * 24 * 60 * 60 * 1000;
+      if (inFirstWeek) {
+        const q = nextFirstWeekQuestion(user);
+        if (q) {
+          body = (user.name ? ("Hey " + user.name + " - ") : "Hey - ") + q.text;
+          const asked = Array.isArray(user.firstWeekAsked) ? user.firstWeekAsked.slice() : [];
+          asked.push(q.key);
+          upd.firstWeekAsked = asked;
+        }
+      }
+
+      // ---- Steady state (or first week with nothing left to ask): Mon/Wed/Fri ----
+      if (!body) {
+        if (CHECKIN_DAYS.indexOf(wh.weekday) === -1) continue;
+
+        let reason = '';
+        let leadToChase = null;
+        if (user.knowledge && Array.isArray(user.knowledge.leads)) {
+          const tenDaysAgo = Date.now() - 10 * 24 * 60 * 60 * 1000;
+          leadToChase = user.knowledge.leads.find(function(l) {
+            return l && l.status !== 'closed' && (!l.lastAskedAt || new Date(l.lastAskedAt).getTime() < tenDaysAgo);
+          });
+        }
+
+        if (leadToChase) {
+          reason = "You mentioned " + leadToChase.label + " a while back - did that go anywhere? Happy to set a follow-up or close it off.";
+          leadToChase.lastAskedAt = new Date().toISOString();
+          upd.knowledge = user.knowledge; // persist the lead's lastAskedAt
+        } else if (!user.knowledge || !user.knowledge.suppliers || user.knowledge.suppliers.length === 0) {
+          reason = "Do you have any go-to suppliers I should know about? It helps me keep an eye on prices and remind you about orders.";
+        } else if (!user.knowledge || !user.knowledge.team || user.knowledge.team.length === 0) {
+          reason = "Is there anyone on your crew I should know about? I can keep track of who's doing what on each job.";
+        } else {
+          const nudges = [
+            "Anything on the go I should know about? Happy to take notes, set reminders, or chase something up.",
+            "How's the week shaping up? Sing out if there's a quote to follow, an order to place, or a reminder to set.",
+            "Need me to lock in any reminders or keep tabs on a job today? Just flick me a message."
+          ];
+          reason = nudges[Math.floor(Math.random() * nudges.length)];
+        }
+        body = "Hey " + user.name + " - " + reason;
       }
 
       try {
         await twilioClient.messages.create({
-          body: "Hey " + user.name + " - " + reason,
+          body: body,
           from: process.env.TWILIO_PHONE_NUMBER,
           to: phone
         });
-        await db.collection('users').doc(phone).update({ lastProactiveAt: new Date().toISOString() });
+        await db.collection('users').doc(phone).update(upd);
         console.log("Proactive sent to: " + phone);
       } catch (err) { console.error("Proactive failed:", err); }
     }
@@ -510,9 +750,8 @@ app.post('/sms', async function(req, res) {
         await saveUser(userPhone, user);
 
         // One combined welcome + save-contact message, with Flow's photo attached.
-        const intro = user.name ? ("You're in, " + user.name + " - ") : "You're in - ";
         const contactMsg = twiml.message();
-        contactMsg.body(intro + "I'm Flow, your SiteFlow assistant built for construction. I've already got your business details from signup, so we're good to go. One quick thing first: save this number as 'SiteFlow' and add my photo if you like, so I'm easy to find. Give me a shout when that's done.");
+        contactMsg.body("You're in - I'm Flow, your SiteFlow assistant. I've already got your business details from signup. One last thing though: save this number as 'SiteFlow Assistant' and add my photo so I'm easy to find. Press the photo I've sent, hold it down and save it, then set it as my profile picture. Give me a shout when you're done.");
         if (FLOW_PHOTO_URL) { contactMsg.media(FLOW_PHOTO_URL); }
       } else if (codeDoc.exists) {
         twiml.message("That code's already been used. Reach out at siteflowassistant.com for a fresh one.");
@@ -528,6 +767,7 @@ app.post('/sms', async function(req, res) {
     if (!user.onboarded) {
       user.onboarded = true;
       user.step = 'done';
+      user.signupAt = new Date().toISOString(); // starts the first-week getting-to-know-you clock
       await saveUser(userPhone, user);
       const hi = user.name ? ("Thanks " + user.name + " - ") : "Thanks - ";
       twiml.message(hi + "that's everything sorted. I've got your back from here. Whenever something needs doing, just tell me and I'll keep you on track.");
@@ -679,6 +919,89 @@ app.post('/sms', async function(req, res) {
       }
     }
 
+    // "Connect my Xero" -> text back a one-time connect link.
+    if (wantsXeroConnect(userMessage)) {
+      if (!xeroConfigured()) {
+        twiml.message("Xero isn't switched on yet at our end - hang tight, it's coming.");
+        return reply();
+      }
+      const t = await createConnectToken(userPhone, 'xero');
+      twiml.message("Connect your Xero here (takes about a minute): " + APP_BASE_URL + "/connect/xero?t=" + t + " - once it's done, just ask me how the money's looking.");
+      return reply();
+    }
+
+    // Live money / invoice questions, answered from Xero.
+    if (isMoneyQuery(userMessage)) {
+      if (!user.integrations || !user.integrations.xero) {
+        if (xeroConfigured()) {
+          const t = await createConnectToken(userPhone, 'xero');
+          twiml.message("I can pull that straight from your Xero once it's connected: " + APP_BASE_URL + "/connect/xero?t=" + t);
+        } else {
+          twiml.message("I can't see your books yet - Xero isn't connected.");
+        }
+        return reply();
+      }
+      try {
+        const summary = await getXeroMoneySummary(userPhone, user);
+        twiml.message(summary);
+      } catch (err) {
+        console.error('Xero money query failed:', err);
+        twiml.message("Couldn't reach Xero just now - give it another go in a moment. If it keeps happening you may need to reconnect: text \"connect Xero\".");
+      }
+      return reply();
+    }
+
+    // "Any work going? / find me tenders" - public work + tender search.
+    if (wantsLeadSearch(userMessage)) {
+      try {
+        const region = user.state || 'Australia';
+        const trade = user.trade || 'construction';
+        const area = user.workAreas ? (user.workAreas + ' ') : '';
+        const q = trade + ' tenders contracts work available ' + area + region + ' Australia AusTender Tenderlink construction';
+        const results = await searchWeb(q);
+        if (!results || /unavailable|no search results|could not (parse|decode)/i.test(results)) {
+          twiml.message("Couldn't turn up any open work right now - I'll keep an eye out. Want me to set a reminder to check again next week?");
+          return reply();
+        }
+        const resp = await openai.chat.completions.create({
+          model: 'gpt-4o-mini', max_tokens: 200,
+          messages: [
+            { role: 'system', content: "You are Flow, helping an Australian " + trade + " in " + region + " find work. From the web results, pull the most relevant open tenders or available jobs for this trade and area. List the best one or two: what it is, where, and the closing date if shown. Australian spelling. Max three short sentences. Be honest - if nothing in the results clearly fits, say you didn't find a solid match this time. Never invent listings or dates." },
+            { role: 'user', content: results }
+          ]
+        });
+        let pick = (resp.choices[0].message.content || '').trim();
+        if (!pick) pick = "Nothing solid came up this time - I'll keep looking.";
+        twiml.message(pick);
+      } catch (err) {
+        console.error('Lead search failed:', err);
+        twiml.message("Couldn't run that search just now - give it another go in a sec.");
+      }
+      return reply();
+    }
+
+    // "Find me a labourer / write a job ad" - hiring helper (opt-in feature).
+    if (wantsHiringHelp(userMessage) && !(user.preferences && user.preferences.employeeSearch === false)) {
+      try {
+        const region = user.state || 'Australia';
+        const area = user.workAreas || region;
+        const resp = await openai.chat.completions.create({
+          model: 'gpt-4o-mini', max_tokens: 260,
+          messages: [
+            { role: 'system', content: "You are Flow, helping an Australian " + (user.trade || 'construction') + " business owner hire. From their message, work out the role they want. Write a short, ready-to-post job ad (4-6 lines: role, location " + area + ", what's involved, and 'text/call to apply'). Then on a new line add: 'Best spots to post: Seek, Gumtree, and your local trade Facebook groups.' Australian spelling and dollars. Keep it tight and practical. Don't invent a wage unless they gave one." },
+            { role: 'user', content: userMessage }
+          ]
+        });
+        let ad = (resp.choices[0].message.content || '').trim();
+        if (!ad) ad = "Tell me the role and I'll draft you a job ad you can post.";
+        twiml.message(ad);
+      } catch (err) {
+        console.error('Hiring helper failed:', err);
+        twiml.message("Couldn't draft that just now - try me again in a moment.");
+      }
+      return reply();
+    }
+
     const reminderKeywords = ['remind me', 'reminder', "don't let me forget", 'make sure i'];
     const hasReminder = reminderKeywords.some(function(k) { return userMessage.toLowerCase().includes(k); });
 
@@ -718,9 +1041,15 @@ app.post('/sms', async function(req, res) {
       "\nKnown team: " + JSON.stringify(user.knowledge.team) +
       "\nKnown suppliers: " + JSON.stringify(user.knowledge.suppliers) +
       "\nKnown clients: " + JSON.stringify(user.knowledge.clients) +
-      "\nBusiness notes: " + JSON.stringify(user.knowledge.notes) : '';
+      "\nBusiness notes: " + JSON.stringify(user.knowledge.notes) +
+      "\nOpen leads/jobs to chase: " + JSON.stringify(user.knowledge.leads || []) : '';
 
-    const systemPrompt = "You are Flow, an AI assistant built specifically for Australian construction business owners.\n\nRULES:\n- Professional and direct - no fluff\n- Never say you cannot access the internet\n- Never offer further help at the end of a message\n- Never end with a question unless you genuinely need information\n- Never mention ChatGPT or OpenAI\n- Always refer to yourself as Flow\n- Maximum three sentences per reply\n- Australian spelling and dollars\n- Always use the user's work areas and state for location based questions\n- You know their regular suppliers and their biggest admin headache. Reference suppliers by name when ordering or prices come up, and look for natural chances to help with that admin pain.\n\nWhen search results are provided you MUST use them.\n\nFor reminders with a clear time confirm in one sentence then add: REMINDER: [task] | [time]\n\nIf the user asks for something you genuinely cannot do, respond warmly in one or two sentences, tell them it is not a current feature, then add on its OWN new line exactly:\nFEATURE_REQUEST: [what they asked for]\n\nAs you chat, quietly learn about the business. When you learn something genuinely new (not already listed below), add it on its OWN new line at the very end of your reply using these tags - do not repeat a tag for something already known:\nLEARN_TEAM: [name] | [role]\nLEARN_SUPPLIER: [name] | [category]\nLEARN_CLIENT: [name] | [notes]\nLEARN_NOTE: [fact]\nThese tags are stripped before the user sees the message, so keep them off the lines the user reads.\n\nWhen the user mentions a person's name you don't recognise from the team list, after completing their request ask: 'Is [name] part of your team? I can keep track of them for you.'\n\nUser profile: " + user.businessContext + teamContext + knowledgeContext + "\nName: " + user.name + "\nState: " + user.state + "\nWork areas: " + user.workAreas + "\nWork hours: " + user.workHours + "\nFinish time: " + user.finishTime + "\nRegular suppliers: " + user.suppliers + "\nBiggest admin headache: " + user.adminHeadache + "\nLocal time: " + new Date().toLocaleString('en-AU', { timeZone: userTz }) + searchContext;
+    const xeroConnected = !!(user.integrations && user.integrations.xero);
+    const integrationsContext = xeroConnected
+      ? "\nThis user has connected Xero. You CAN see their invoices and money owed - if they ask about cash, invoices, or who owes them, that is handled live elsewhere, so just answer naturally and never say you can't access their accounts."
+      : "\nThis user has NOT connected Xero yet. If they ask about invoices or money owed, tell them you can pull it from Xero once it's connected and that they can text 'connect Xero' to set it up.";
+
+    const systemPrompt = "You are Flow, an AI assistant built specifically for Australian construction business owners.\n\nRULES:\n- Professional and direct - no fluff\n- Never say you cannot access the internet\n- Never offer further help at the end of a message\n- Never end with a question unless you genuinely need information\n- Never mention ChatGPT or OpenAI\n- Always refer to yourself as Flow\n- Maximum three sentences per reply\n- Australian spelling and dollars\n- Always use the user's work areas and state for location based questions\n- You know their regular suppliers and their biggest admin headache. Reference suppliers by name when ordering or prices come up, and look for natural chances to help with that admin pain.\n\nWhen search results are provided you MUST use them.\n\nFor reminders with a clear time confirm in one sentence then add: REMINDER: [task] | [time]\n\nIf the user asks for something you genuinely cannot do, respond warmly in one or two sentences, tell them it is not a current feature, then add on its OWN new line exactly:\nFEATURE_REQUEST: [what they asked for]\n\nAs you chat, quietly learn about the business. When you learn something genuinely new (not already listed below), add it on its OWN new line at the very end of your reply using these tags - do not repeat a tag for something already known:\nLEARN_TEAM: [name] | [role]\nLEARN_SUPPLIER: [name] | [category]\nLEARN_CLIENT: [name] | [notes]\nLEARN_NOTE: [fact]\nLEARN_LEAD: [job or client] | [detail]\nUse LEARN_LEAD when they mention a possible job, enquiry, or quote that hasn't been won yet (e.g. someone asked them to price a job). Also: when they tell you their name or what to call them, add on its own line LEARN_NAME: [name]. These tags are stripped before the user sees the message, so keep them off the lines the user reads.\n\nWhen the user mentions a person's name you don't recognise from the team list, after completing their request ask: 'Is [name] part of your team? I can keep track of them for you.'\n\nUser profile: " + user.businessContext + teamContext + knowledgeContext + integrationsContext + "\nName: " + user.name + "\nState: " + user.state + "\nWork areas: " + user.workAreas + "\nWork hours: " + user.workHours + "\nFinish time: " + user.finishTime + "\nRegular suppliers: " + user.suppliers + "\nBiggest admin headache: " + user.adminHeadache + "\nLocal time: " + new Date().toLocaleString('en-AU', { timeZone: userTz }) + searchContext;
 
     const response = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
@@ -783,6 +1112,19 @@ app.post('/sms', async function(req, res) {
         if (fact && user.knowledge.notes.indexOf(fact) === -1) {
           user.knowledge.notes.push(fact);
         }
+      } else if ((m = t.match(/^LEARN_NAME:\s*(.+)/i))) {
+        const nm = m[1].trim().replace(/[.!,]+$/, '');
+        if (nm && nm.length <= 40) {
+          user.name = nm;
+          user.businessContext = buildBusinessContext(user);
+        }
+      } else if ((m = t.match(/^LEARN_LEAD:\s*(.+)/i))) {
+        const parts = m[1].split('|').map(function(s) { return s.trim(); });
+        const label = parts[0], detail = parts[1];
+        if (!Array.isArray(user.knowledge.leads)) user.knowledge.leads = [];
+        if (label && !user.knowledge.leads.find(function(x) { return x.label === label; })) {
+          user.knowledge.leads.push({ label: label, detail: detail || '', status: 'open', addedAt: new Date().toISOString(), lastAskedAt: null });
+        }
       } else {
         keptLines.push(line);
       }
@@ -805,6 +1147,93 @@ app.post('/sms', async function(req, res) {
       res.writeHead(200, { 'Content-Type': 'text/xml' });
       res.end(t.toString());
     }
+  }
+});
+
+// ---- Xero OAuth: connect + callback ----------------------------------------
+
+// Step 1: the builder taps the link Flow texted (carries a one-time token `t`).
+// We validate it, remember which phone it belongs to, and bounce them to Xero.
+app.get('/connect/xero', async function(req, res) {
+  try {
+    if (!xeroConfigured()) { res.status(500).send('Xero is not configured on the server yet.'); return; }
+    const t = (req.query.t || '').toString();
+    const tokenDoc = t ? await db.collection('connect_tokens').doc(t).get() : null;
+    if (!tokenDoc || !tokenDoc.exists || tokenDoc.data().used === true || tokenDoc.data().provider !== 'xero') {
+      res.status(400).send('This connect link is invalid or has expired. Text Flow "connect Xero" for a fresh one.');
+      return;
+    }
+    const authUrl = 'https://login.xero.com/identity/connect/authorize'
+      + '?response_type=code'
+      + '&client_id=' + encodeURIComponent(XERO_CLIENT_ID)
+      + '&redirect_uri=' + encodeURIComponent(XERO_REDIRECT_URI)
+      + '&scope=' + encodeURIComponent(XERO_SCOPES)
+      + '&state=' + encodeURIComponent(t);
+    res.redirect(authUrl);
+  } catch (err) {
+    console.error('connect/xero error:', err);
+    res.status(500).send('Something went wrong starting the Xero connection.');
+  }
+});
+
+// Step 2: Xero redirects back with a code. Exchange it, grab the tenant, store
+// the tokens on the user, and show a simple done page.
+app.get('/callback/xero', async function(req, res) {
+  try {
+    const code = (req.query.code || '').toString();
+    const state = (req.query.state || '').toString();
+    if (!code || !state) { res.status(400).send('Missing authorisation details from Xero.'); return; }
+
+    const tokenDoc = await db.collection('connect_tokens').doc(state).get();
+    if (!tokenDoc.exists || tokenDoc.data().used === true) {
+      res.status(400).send('This connection link has already been used. Text Flow "connect Xero" to try again.');
+      return;
+    }
+    const phone = tokenDoc.data().phone;
+
+    // Exchange the code for tokens.
+    const tok = await xeroTokenRequest({
+      grant_type: 'authorization_code',
+      code: code,
+      redirect_uri: XERO_REDIRECT_URI
+    });
+
+    // Find which Xero organisation (tenant) was authorised.
+    const connResp = await fetch('https://api.xero.com/connections', {
+      headers: { 'Authorization': 'Bearer ' + tok.access_token, 'Accept': 'application/json' }
+    });
+    const connections = await connResp.json();
+    const first = Array.isArray(connections) && connections.length > 0 ? connections[0] : null;
+    if (!first) { res.status(400).send('No Xero organisation came back from the connection. Please try again.'); return; }
+
+    const user = await getUser(phone);
+    backfillUser(user);
+    user.integrations.xero = {
+      tenantId: first.tenantId,
+      tenantName: first.tenantName || '',
+      accessToken: tok.access_token,
+      refreshToken: tok.refresh_token,
+      expiresAt: Date.now() + (tok.expires_in || 1800) * 1000,
+      connectedAt: new Date().toISOString()
+    };
+    await saveUser(phone, user);
+    await db.collection('connect_tokens').doc(state).update({ used: true, usedAt: admin.firestore.Timestamp.now() });
+
+    // Let the builder know over SMS too.
+    try {
+      await twilioClient.messages.create({
+        body: "Xero's connected" + (user.name ? ", " + user.name : "") + ". Ask me anything like \"how's the money looking?\" and I'll pull it live.",
+        from: process.env.TWILIO_PHONE_NUMBER,
+        to: phone
+      });
+    } catch (e) { console.error('Xero connect SMS failed:', e); }
+
+    res.set('Content-Type', 'text/html');
+    res.send('<html><body style="font-family:system-ui;text-align:center;padding:48px">' +
+      '<h2>Xero connected ✔</h2><p>You can close this and head back to your texts with Flow.</p></body></html>');
+  } catch (err) {
+    console.error('callback/xero error:', err);
+    res.status(500).send('Could not finish connecting Xero. Please try the link again.');
   }
 });
 
