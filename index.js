@@ -535,6 +535,42 @@ function wantsLogbookSummary(message) {
     || /\b(km|kms) (this|for) (week|month|year|fortnight|quarter)\b/.test(lower);
 }
 
+// ----- Tickets & compliance: track expiry dates and warn early -----
+function daysBetweenKeys(fromKey, toKey) {
+  const a = new Date(fromKey + 'T00:00:00Z');
+  const b = new Date(toKey + 'T00:00:00Z');
+  return Math.round((b - a) / 86400000);
+}
+
+function fmtDateKey(key) {
+  return new Date(key + 'T00:00:00Z').toLocaleDateString('en-AU', { day: 'numeric', month: 'short', year: 'numeric', timeZone: 'UTC' });
+}
+
+function parseComplianceEntry(message, tz) {
+  const lower = (message || '').toLowerCase();
+  if (/\bremind|reminder|don'?t let me forget\b/.test(lower)) return null; // explicit reminder, not a compliance item
+  if (!/\b(expires?|expiry|expiring|renews?|renewal|valid (?:until|to|till)|runs? out|lapses?|due)\b/.test(lower)) return null;
+  const when = chrono.parseDate(message, { instant: new Date(), timezone: tzOffsetMinutes(tz, new Date()) }, { forwardDate: true });
+  if (!when) return null;
+  let label = message
+    .replace(/\b(expires?|expiry|expiring|renews?|renewal|valid (until|to|till)|runs? out|lapses?|is due|due)\b.*$/i, ' ')
+    .replace(/\b(my|the|our|a|an)\b/gi, ' ')
+    .replace(/[^a-zA-Z0-9 &/'-]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!label) label = 'ticket';
+  return { label: label, expiry: localDateKey(tz, when) };
+}
+
+function wantsComplianceList(message) {
+  const lower = (message || '').toLowerCase();
+  const noun = /\b(tickets?|compliance|licen[cs]es?|certs?|certificates?|insurances?|white ?cards?|swms|inductions?)\b/.test(lower);
+  const ask = /\b(show|list|what|when|expir|due|check|status|track|got|have)\b/.test(lower);
+  return /\bwhat'?s expiring\b/.test(lower)
+    || (noun && ask)
+    || /^(my )?(tickets|compliance)\??$/.test(lower.trim());
+}
+
 // Log anything Flow can't do yet so the team can see what people are asking for.
 async function logFeatureRequest(phone, trade, request) {
   await db.collection('feature_requests').add({
@@ -1170,6 +1206,59 @@ setInterval(async function() {
   } catch (err) { console.error('Evening alert scheduler error:', err); }
 }, 60 * 60 * 1000);
 
+// 6) Tickets & compliance expiry warnings - hourly check, fires ~7am local once a
+// day. Warns at 30/14/7/1 days out and on/after expiry, once per threshold.
+setInterval(async function() {
+  try {
+    const snapshot = await db.collection('users')
+      .where('onboarded', '==', true)
+      .get();
+
+    for (const doc of snapshot.docs) {
+      const user = doc.data();
+      const phone = doc.id;
+      if (!Array.isArray(user.compliance) || !user.compliance.length) continue;
+
+      const tz = tzForState(user.state);
+      if (localWeekdayHour(tz).hour !== 7) continue; // once-a-day morning check
+      const todayKey = localDateKey(tz);
+
+      let changed = false;
+      for (const item of user.compliance) {
+        if (!item || !item.expiry) continue;
+        if (!Array.isArray(item.warned)) item.warned = [];
+        const left = daysBetweenKeys(todayKey, item.expiry);
+
+        let level = null;
+        if (left <= 0 && item.warned.indexOf(0) === -1) level = 0;
+        else if (left <= 1 && item.warned.indexOf(1) === -1) level = 1;
+        else if (left <= 7 && item.warned.indexOf(7) === -1) level = 7;
+        else if (left <= 14 && item.warned.indexOf(14) === -1) level = 14;
+        else if (left <= 30 && item.warned.indexOf(30) === -1) level = 30;
+        if (level === null) continue;
+
+        const nm = user.name || 'mate';
+        let body;
+        if (left < 0) body = "Heads up " + nm + " - your " + item.label + " expired " + Math.abs(left) + " day(s) ago. Worth sorting before it bites you on site.";
+        else if (left === 0) body = "Heads up " + nm + " - your " + item.label + " expires TODAY. Best get it renewed so you're not caught out.";
+        else body = "Heads up " + nm + " - your " + item.label + " expires in " + left + " day(s). Might be time to get the renewal moving.";
+
+        try {
+          await twilioClient.messages.create({ body: body, from: process.env.TWILIO_PHONE_NUMBER, to: phone });
+          item.warned.push(level);
+          changed = true;
+          console.log("Compliance warning sent to " + phone + ": " + item.label);
+        } catch (err) { console.error('Compliance warning failed:', err); }
+      }
+
+      if (changed) {
+        try { await db.collection('users').doc(phone).update({ compliance: user.compliance }); }
+        catch (e) { console.error('Compliance save failed:', e); }
+      }
+    }
+  } catch (err) { console.error('Compliance scheduler error:', err); }
+}, 60 * 60 * 1000);
+
 // ============================ SMS WEBHOOK ============================
 
 app.post('/sms', async function(req, res) {
@@ -1506,6 +1595,40 @@ app.post('/sms', async function(req, res) {
         console.error('Hiring helper failed:', err);
         twiml.message("Couldn't draft that just now - try me again in a moment.");
       }
+      return reply();
+    }
+
+    // Tickets & compliance: "my white card expires 3 March 2027" -> track + warn early.
+    {
+      const comp = parseComplianceEntry(userMessage, userTz);
+      if (comp) {
+        if (!Array.isArray(user.compliance)) user.compliance = [];
+        const existing = user.compliance.find(function (c) { return c && c.label && c.label.toLowerCase() === comp.label.toLowerCase(); });
+        if (existing) { existing.expiry = comp.expiry; existing.warned = []; }
+        else user.compliance.push({ label: comp.label, expiry: comp.expiry, warned: [] });
+        await saveUser(userPhone, user);
+        const left = daysBetweenKeys(localDateKey(userTz), comp.expiry);
+        const away = left >= 0 ? (left + " days away") : (Math.abs(left) + " days ago");
+        twiml.message("Got it - " + comp.label + " expires " + fmtDateKey(comp.expiry) + " (" + away + "). I'll give you a heads-up well before it's due. If I've read the date wrong, just resend it.");
+        return reply();
+      }
+    }
+
+    // "Show my tickets" / "what's expiring" - list tracked compliance.
+    if (wantsComplianceList(userMessage)) {
+      const items = Array.isArray(user.compliance) ? user.compliance.slice() : [];
+      if (!items.length) {
+        twiml.message("No tickets or compliance tracked yet. Tell me like \"my white card expires 3 March 2027\" or \"public liability renews 1 July\" and I'll keep an eye on the dates.");
+        return reply();
+      }
+      const today = localDateKey(userTz);
+      items.sort(function (a, b) { return (a.expiry || '').localeCompare(b.expiry || ''); });
+      const lines = items.slice(0, 12).map(function (c) {
+        const left = daysBetweenKeys(today, c.expiry);
+        const tag = left < 0 ? ("EXPIRED " + Math.abs(left) + "d ago") : (left + "d");
+        return "- " + c.label + ": " + fmtDateKey(c.expiry) + " (" + tag + ")";
+      });
+      twiml.message("Your tickets & compliance:\n" + lines.join('\n'));
       return reply();
     }
 
