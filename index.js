@@ -205,7 +205,7 @@ function isPreferenceUpdate(message) {
   if (lower.trim().split(/\s+/).length > 14) return false;
   const intent = /\b(start|turn on|enable|send me|stop|turn off|disable|no thanks)\b/.test(lower)
     || /don'?t send|do not send/.test(lower);
-  const feature = /\b(specials?|check[- ]?ins?|proactive|tenders?|alerts?|employees?)\b/.test(lower);
+  const feature = /\b(specials?|check[- ]?ins?|proactive|tenders?|alerts?|employees?|weather|forecast)\b/.test(lower);
   return intent && feature;
 }
 
@@ -542,6 +542,141 @@ function nextFirstWeekQuestion(user) {
   return null;
 }
 
+// ============================ WEATHER ============================
+// Free, key-less forecasts via Open-Meteo (geocoding + daily forecast). The
+// geocode result is cached on the user doc (weatherGeo) so we only look it up once.
+
+async function getJson(url) {
+  try {
+    const resp = await fetch(url, { headers: { Accept: 'application/json' } });
+    if (!resp.ok) return null;
+    return await resp.json();
+  } catch (e) { return null; }
+}
+
+// Turn the user's work area (or state) into lat/long. Biases to Australian hits.
+async function geocodeForUser(user) {
+  if (user.weatherGeo && typeof user.weatherGeo.lat === 'number') return user.weatherGeo;
+  const raw = (user.workAreas || user.state || '').split(/[,/&]|\band\b/i)[0].trim();
+  if (!raw) return null;
+  const data = await getJson('https://geocoding-api.open-meteo.com/v1/search?count=5&language=en&format=json&name=' + encodeURIComponent(raw));
+  if (!data || !data.results || !data.results.length) return null;
+  const au = data.results.filter(function (r) { return r.country_code === 'AU'; });
+  const r = au[0] || data.results[0];
+  return { lat: r.latitude, lon: r.longitude, label: r.name + (r.admin1 ? (', ' + r.admin1) : '') };
+}
+
+function wmoText(code) {
+  const m = { 0:'clear skies', 1:'mostly sunny', 2:'partly cloudy', 3:'overcast', 45:'foggy', 48:'foggy',
+    51:'light drizzle', 53:'drizzle', 55:'heavy drizzle', 56:'freezing drizzle', 57:'freezing drizzle',
+    61:'light rain', 63:'steady rain', 65:'heavy rain', 66:'freezing rain', 67:'freezing rain',
+    71:'light snow', 73:'snow', 75:'heavy snow', 77:'snow grains',
+    80:'passing showers', 81:'showers', 82:'heavy showers', 85:'snow showers', 86:'snow showers',
+    95:'thunderstorms', 96:'storms with hail', 99:'severe storms with hail' };
+  return m[code] || 'mixed conditions';
+}
+
+async function fetchForecast(geo) {
+  const url = 'https://api.open-meteo.com/v1/forecast?latitude=' + geo.lat + '&longitude=' + geo.lon +
+    '&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_sum,precipitation_probability_max,wind_speed_10m_max,wind_gusts_10m_max,uv_index_max' +
+    '&timezone=auto&forecast_days=2';
+  const data = await getJson(url);
+  if (!data || !data.daily || !data.daily.time) return null;
+  const d = data.daily;
+  function day(i) {
+    if (i >= d.time.length) return null;
+    return {
+      code: d.weather_code[i],
+      tmax: d.temperature_2m_max[i], tmin: d.temperature_2m_min[i],
+      rain: d.precipitation_sum[i],
+      rainProb: d.precipitation_probability_max ? d.precipitation_probability_max[i] : null,
+      wind: d.wind_speed_10m_max[i], gust: d.wind_gusts_10m_max[i],
+      uv: d.uv_index_max ? d.uv_index_max[i] : null
+    };
+  }
+  return { today: day(0), tomorrow: day(1) };
+}
+
+// "Bad weather" worth a heads-up, per the owner's definition: extreme heat
+// (38 degrees or hotter) or extreme rain (a heavy 25mm+ day).
+function extremeReasons(day) {
+  if (!day) return [];
+  const r = [];
+  if (day.tmax >= 38) r.push('extreme heat around ' + Math.round(day.tmax) + ' degrees');
+  if (day.rain >= 25) r.push('extreme rain, around ' + Math.round(day.rain) + 'mm');
+  return r;
+}
+
+function describeDay(label, place, day) {
+  let s = label + (place ? (' in ' + place) : '') + ': ' + wmoText(day.code) + ', ' +
+    Math.round(day.tmin) + ' to ' + Math.round(day.tmax) + ' degrees';
+  if (day.rainProb != null) s += ', ' + day.rainProb + '% chance of rain';
+  if (day.rain) s += ' (' + Math.round(day.rain) + 'mm)';
+  s += ', wind to ' + Math.round(day.wind) + ' km/h, gusts ' + Math.round(day.gust);
+  if (day.uv != null) s += ', UV max ' + Math.round(day.uv);
+  return s + '.';
+}
+
+// Build the funny morning weather report. A next-day heads-up is folded into the
+// same message when tomorrow looks extreme. Returns { body, geo } or null.
+async function buildWeatherMessage(user) {
+  const geo = await geocodeForUser(user);
+  if (!geo) return null;
+  const fc = await fetchForecast(geo);
+  if (!fc || !fc.today) return null;
+
+  const todayLine = describeDay('TODAY', geo.label, fc.today);
+  const reasons = extremeReasons(fc.tomorrow);
+  const extremeLine = reasons.length ? ('TOMORROW is shaping up extreme: ' + reasons.join('; ') + '.') : '';
+
+  const sys = "You are Flow, an Australian tradie's text-message assistant delivering a VERY SHORT, funny morning weather report - like a larger-than-life weather presenter who also works in construction. " +
+    "Keep it to 2 short sentences, about 35 words max: one painting today's weather with a touch of Aussie humour, one practical line for working outdoors (good day for a pour/paint/roof, or a washout; quick sunsmart nudge only if the UV is high). " +
+    "Greet them by name once. Use the figures provided and DO NOT invent any numbers. Australian spelling, degrees C. No hashtags, no emojis. " +
+    (extremeLine ? "Then add ONE short line warning about TOMORROW's extreme weather (make clear it is tomorrow). " : "") +
+    "Do not add any labels, tags, or sign-off.";
+  const userContent = 'Name: ' + (user.name || 'mate') + '\n' + todayLine + (extremeLine ? ('\n' + extremeLine) : '');
+
+  let body;
+  try {
+    const resp = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      max_tokens: 130,
+      messages: [{ role: 'system', content: sys }, { role: 'user', content: userContent }]
+    });
+    body = (resp.choices[0].message.content || '').trim();
+  } catch (e) { console.error('Weather LLM failed:', e); return null; }
+  if (!body) return null;
+  return { body: body, geo: geo };
+}
+
+// Short evening heads-up (around 8pm) sent the night before extreme weather.
+// Returns { body, geo }, or null when tomorrow is nothing to worry about.
+async function buildEveningAlert(user) {
+  const geo = await geocodeForUser(user);
+  if (!geo) return null;
+  const fc = await fetchForecast(geo);
+  if (!fc || !fc.tomorrow) return null;
+  const reasons = extremeReasons(fc.tomorrow);
+  if (!reasons.length) return null;
+
+  const sys = "You are Flow, an Australian tradie's text-message assistant sending a VERY SHORT evening heads-up the night before rough weather. " +
+    "Keep it to 1-2 sentences, about 30 words max: what tomorrow is bringing plus one quick practical tip (start early and hydrate in the heat, or plan indoor work if it will bucket down). " +
+    "Greet them by name once. Use the figures provided and DO NOT invent numbers. Australian spelling, degrees C. No hashtags, no emojis. Make clear this is about TOMORROW. Do not add any labels, tags, or sign-off.";
+  const userContent = 'Name: ' + (user.name || 'mate') + '\nTOMORROW: ' + reasons.join('; ') + '. ' + describeDay('Tomorrow', geo.label, fc.tomorrow);
+
+  let body;
+  try {
+    const resp = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      max_tokens: 80,
+      messages: [{ role: 'system', content: sys }, { role: 'user', content: userContent }]
+    });
+    body = (resp.choices[0].message.content || '').trim();
+  } catch (e) { console.error('Evening alert LLM failed:', e); return null; }
+  if (!body) return null;
+  return { body: body, geo: geo };
+}
+
 // ============================ SCHEDULERS ============================
 // NOTE: these rely on the process staying awake. On a Render instance that
 // spins down when idle they will NOT run reliably - use an always-on instance
@@ -708,6 +843,81 @@ setInterval(async function() {
       } catch (err) { console.error('Specials send failed:', err); }
     }
   } catch (err) { console.error('Specials scheduler error:', err); }
+}, 60 * 60 * 1000);
+
+// 4) Morning weather report - hourly check, fires in the 5-8am local window, once
+// per day, opt-out via "stop weather". Funny weather-reporter style, with a next-day
+// heads-up folded into the same message when tomorrow looks extreme.
+setInterval(async function() {
+  try {
+    const snapshot = await db.collection('users')
+      .where('onboarded', '==', true)
+      .get();
+
+    for (const doc of snapshot.docs) {
+      const user = doc.data();
+      const phone = doc.id;
+
+      if (user.preferences && user.preferences.weatherReports === false) continue;
+
+      const wh = localWeekdayHour(tzForState(user.state));
+      if (wh.hour !== 4) continue; // 4am local, every day
+      if (user.lastWeatherAt && (Date.now() - new Date(user.lastWeatherAt).getTime()) < 20 * 60 * 60 * 1000) continue;
+
+      let result;
+      try { result = await buildWeatherMessage(user); }
+      catch (e) { console.error('Weather build failed:', e); continue; }
+      if (!result || !result.body) continue;
+
+      let body = result.body;
+      if (!user.weatherIntroSent) {
+        body += "\n\n(I'll send this each morning - reply \"stop weather\" to switch it off.)";
+      }
+
+      try {
+        await twilioClient.messages.create({ body: body, from: process.env.TWILIO_PHONE_NUMBER, to: phone });
+        const upd = { lastWeatherAt: new Date().toISOString(), weatherIntroSent: true };
+        if (result.geo) upd.weatherGeo = result.geo; // cache the geocode lookup
+        await db.collection('users').doc(phone).update(upd);
+        console.log("Weather sent to: " + phone);
+      } catch (err) { console.error('Weather send failed:', err); }
+    }
+  } catch (err) { console.error('Weather scheduler error:', err); }
+}, 60 * 60 * 1000);
+
+// 5) Evening extreme-weather heads-up - hourly check, fires ~8pm local, once a
+// day, and ONLY when tomorrow is extreme (38C+ heat or 25mm+ rain). Shares the
+// "stop weather" opt-out with the morning report.
+setInterval(async function() {
+  try {
+    const snapshot = await db.collection('users')
+      .where('onboarded', '==', true)
+      .get();
+
+    for (const doc of snapshot.docs) {
+      const user = doc.data();
+      const phone = doc.id;
+
+      if (user.preferences && user.preferences.weatherReports === false) continue;
+
+      const wh = localWeekdayHour(tzForState(user.state));
+      if (wh.hour !== 20) continue; // 8pm local
+      if (user.lastWeatherEveningAt && (Date.now() - new Date(user.lastWeatherEveningAt).getTime()) < 20 * 60 * 60 * 1000) continue;
+
+      let result;
+      try { result = await buildEveningAlert(user); }
+      catch (e) { console.error('Evening alert build failed:', e); continue; }
+      if (!result || !result.body) continue; // tomorrow's fine -> stay quiet
+
+      try {
+        await twilioClient.messages.create({ body: result.body, from: process.env.TWILIO_PHONE_NUMBER, to: phone });
+        const upd = { lastWeatherEveningAt: new Date().toISOString() };
+        if (result.geo) upd.weatherGeo = result.geo; // cache the geocode lookup
+        await db.collection('users').doc(phone).update(upd);
+        console.log("Evening weather alert sent to: " + phone);
+      } catch (err) { console.error('Evening alert send failed:', err); }
+    }
+  } catch (err) { console.error('Evening alert scheduler error:', err); }
 }, 60 * 60 * 1000);
 
 // ============================ SMS WEBHOOK ============================
@@ -955,6 +1165,7 @@ app.post('/sms', async function(req, res) {
       if (/\b(check[- ]?ins?|proactive)\b/.test(lower)) { user.preferences.proactiveCheckins = !turnOff; changed = 'check-ins'; }
       if (/\b(tenders?|alerts?)\b/.test(lower))         { user.preferences.tenderAlerts      = !turnOff; changed = 'tender alerts'; }
       if (/\bemployees?\b/.test(lower))                 { user.preferences.employeeSearch    = !turnOff; changed = 'employee search'; }
+      if (/\b(weather|forecast)\b/.test(lower))         { user.preferences.weatherReports    = !turnOff; changed = 'morning weather reports'; }
 
       if (changed) {
         await saveUser(userPhone, user);
