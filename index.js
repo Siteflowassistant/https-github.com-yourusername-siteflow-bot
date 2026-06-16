@@ -435,6 +435,106 @@ function extractProductQuery(message) {
     .trim();
 }
 
+// ----- Quick takeoffs: turn dimensions into a material quantity -----
+function toNum(x) { const n = parseFloat(x); return isFinite(n) ? n : null; }
+function round1(n) { return Math.round(n * 10) / 10; }
+
+function wantsTakeoff(message) {
+  const lower = (message || '').toLowerCase();
+  const material = /\b(concrete|cement|tiles?|tiling|paint|painting|render|decking|deck|gravel|topsoil|soil|mulch|screed|pavers?)\b/.test(lower);
+  const ask = /\bhow (much|many)\b/.test(lower) || /\b(take[- ]?off|work out|calculate|how much do i need|how many do i need|quantity)\b/.test(lower);
+  const dims = /\d\s*(?:mm|cm|m)?\s*(?:x|×|by|\*)\s*\d/.test(lower) || /\d+\s*(?:m2|sqm|square ?met)/.test(lower);
+  return material && (ask || dims);
+}
+
+// Deterministic maths (the LLM only parses the request into numbers; code does the sums).
+function computeTakeoff(s) {
+  const m = (s.material || '').toLowerCase();
+  const L = toNum(s.length), W = toNum(s.width), D = toNum(s.depth), H = toNum(s.height);
+
+  if (m === 'concrete') {
+    if (!L || !W || !D) return null;
+    const vol = L * W * D;
+    return "Concrete for " + L + "m x " + W + "m x " + Math.round(D * 1000) + "mm:\n" +
+      "~" + round1(vol) + "m3 (order ~" + round1(vol * 1.1) + "m3 to allow 10% for waste and spillage).\n" +
+      "Worth confirming with your batching plant before the pour.";
+  }
+  if (m === 'tiles') {
+    if (!L || !W) return null;
+    const area = L * W;
+    if (!s.tile_w_mm || !s.tile_h_mm) {
+      return "Tiling area is ~" + round1(area) + "m2 (about " + round1(area * 1.1) + "m2 with 10% for cuts). Tell me the tile size (e.g. 300x300) and I'll give you a tile count.";
+    }
+    const perTile = (s.tile_w_mm / 1000) * (s.tile_h_mm / 1000);
+    const tiles = Math.ceil((area / perTile) * 1.1);
+    return "Tiles for " + L + "m x " + W + "m (" + round1(area) + "m2) at " + s.tile_w_mm + "x" + s.tile_h_mm + ":\n" +
+      "~" + tiles + " tiles incl. 10% for cuts and waste. Round up to full boxes.";
+  }
+  if (m === 'paint') {
+    let area = null;
+    if (L && H) area = L * H;
+    else if (L && W) area = L * W;
+    if (!area) return null;
+    const coats = toNum(s.coats) || 2;
+    const cover = toNum(s.coverage_m2_per_l) || 10;
+    const litres = (area * coats) / cover;
+    return "Paint for ~" + round1(area) + "m2, " + coats + " coat(s) (approx " + cover + "m2/L):\n" +
+      "~" + round1(litres) + "L. Grab the next tin size up so you're not caught short.";
+  }
+  if (m === 'decking') {
+    if (!L || !W) return null;
+    const area = L * W;
+    const bw = toNum(s.board_w_mm) || 90;
+    const gap = toNum(s.gap_mm) || 4;
+    const lineal = area * (1 / ((bw + gap) / 1000)) * 1.1;
+    return "Decking for " + L + "m x " + W + "m (" + round1(area) + "m2), " + bw + "mm boards + " + gap + "mm gap:\n" +
+      "~" + Math.ceil(lineal) + " lineal metres incl. 10% waste. That's boards only - tell me the joist spacing if you want framing too.";
+  }
+  if (m === 'area') {
+    if (!L || !W) return null;
+    return "That's ~" + round1(L * W) + "m2. Tell me the material (concrete, tiles, paint, decking) and I'll turn it into a quantity.";
+  }
+  return null;
+}
+
+// ----- Vehicle logbook: log km against jobs, tally for the financial year -----
+function ausFYStartKey(tz) {
+  const p = new Intl.DateTimeFormat('en-CA', { timeZone: tz, year: 'numeric', month: '2-digit' }).format(new Date()).split('-');
+  let year = parseInt(p[0], 10);
+  if (parseInt(p[1], 10) < 7) year -= 1; // Australian financial year starts 1 July
+  return year + '-07-01';
+}
+function startOfMonthKey(tz) {
+  const p = new Intl.DateTimeFormat('en-CA', { timeZone: tz, year: 'numeric', month: '2-digit' }).format(new Date()).split('-');
+  return p[0] + '-' + p[1] + '-01';
+}
+function sumLogbookSince(log, sinceKey) {
+  return log.reduce(function (t, e) { return (e && e.date && e.date >= sinceKey) ? t + (toNum(e.km) || 0) : t; }, 0);
+}
+function sumLogbookFY(log, tz) { return sumLogbookSince(log, ausFYStartKey(tz)); }
+
+function parseLogbookEntry(message) {
+  const lower = (message || '').toLowerCase();
+  if (/\bremind|reminder|don'?t let me forget|make sure i\b/.test(lower)) return null; // that's a reminder, not a trip
+  const km = lower.match(/(\d+(?:\.\d+)?)\s*(km\b|kms\b|k's\b|ks\b|kays\b|kilometres?\b|kilometers?\b)/);
+  if (!km) return null;
+  const tripContext = /\bto\b/.test(lower) || /\b(log|logged|drove|drive|driving|trip|travel(?:led)?|clocked|ran)\b/.test(lower);
+  if (!tripContext) return null;
+  const distance = parseFloat(km[1]);
+  if (!isFinite(distance) || distance <= 0) return null;
+  let dest = '';
+  const toMatch = (message || '').match(/\bto\s+(?:the\s+)?(.+?)(?:\s+job\b|[.!?]|$)/i);
+  if (toMatch && toMatch[1]) dest = toMatch[1].trim().replace(/\s+/g, ' ');
+  return { km: distance, dest: dest };
+}
+
+function wantsLogbookSummary(message) {
+  const lower = (message || '').toLowerCase();
+  return /\b(log ?book|km log|kms? log)\b/.test(lower)
+    || (/\b(total|how many|how much|sum|tally)\b/.test(lower) && /\b(km|kms|kilometres?|kilometers?|mileage|travel)\b/.test(lower))
+    || /\b(km|kms) (this|for) (week|month|year|fortnight|quarter)\b/.test(lower);
+}
+
 // Log anything Flow can't do yet so the team can see what people are asking for.
 async function logFeatureRequest(phone, trade, request) {
   await db.collection('feature_requests').add({
@@ -1405,6 +1505,55 @@ app.post('/sms', async function(req, res) {
       } catch (err) {
         console.error('Hiring helper failed:', err);
         twiml.message("Couldn't draft that just now - try me again in a moment.");
+      }
+      return reply();
+    }
+
+    // Vehicle logbook: "logbook"/"total km" summarises; "40km to the Geelong job" logs a trip.
+    if (wantsLogbookSummary(userMessage)) {
+      const log = Array.isArray(user.logbook) ? user.logbook : [];
+      if (!log.length) {
+        twiml.message("No trips logged yet. Just text me like \"40km to the Geelong job\" and I'll keep your logbook ticking over for tax time.");
+        return reply();
+      }
+      const fy = sumLogbookFY(log, userTz);
+      const month = sumLogbookSince(log, startOfMonthKey(userTz));
+      twiml.message("Logbook so far:\n- This month: " + round1(month) + "km\n- This financial year: " + round1(fy) + "km\nAcross " + log.length + " trip(s) - handy come EOFY.");
+      return reply();
+    }
+
+    const trip = parseLogbookEntry(userMessage);
+    if (trip) {
+      if (!Array.isArray(user.logbook)) user.logbook = [];
+      user.logbook.push({ km: trip.km, dest: trip.dest || '', date: localDateKey(userTz), at: new Date().toISOString() });
+      if (user.logbook.length > 2000) user.logbook = user.logbook.slice(-2000);
+      await saveUser(userPhone, user);
+      const fy = sumLogbookFY(user.logbook, userTz);
+      twiml.message("Logged " + trip.km + "km" + (trip.dest ? (" to " + trip.dest) : "") + ". You're at " + round1(fy) + "km for the financial year so far.");
+      return reply();
+    }
+
+    // "How much concrete for that slab?" - parse dimensions, do the takeoff.
+    if (wantsTakeoff(userMessage)) {
+      try {
+        const parseResp = await openai.chat.completions.create({
+          model: 'gpt-4o-mini', max_tokens: 200,
+          messages: [
+            { role: 'system', content: "Extract a building-materials takeoff request into JSON ONLY - no prose, no backticks. Convert every length to METRES (100mm thick => 0.1, 450mm => 0.45, 6 => 6). If a number has no unit, assume metres. Schema: {\"material\":\"concrete|tiles|paint|decking|area|unknown\",\"length\":number|null,\"width\":number|null,\"depth\":number|null,\"height\":number|null,\"tile_w_mm\":number|null,\"tile_h_mm\":number|null,\"coats\":number|null,\"board_w_mm\":number|null,\"gap_mm\":number|null,\"coverage_m2_per_l\":number|null}. A 'slab' is concrete with depth = its thickness. Painting a wall uses height for wall height. Use null for anything not stated. If you can't tell the material, set material to \"unknown\"." },
+            { role: 'user', content: userMessage }
+          ]
+        });
+        let spec = null;
+        try { spec = JSON.parse((parseResp.choices[0].message.content || '').replace(/```json|```/g, '').trim()); } catch (e) { spec = null; }
+        const out = spec ? computeTakeoff(spec) : null;
+        if (!out) {
+          twiml.message("Give me the shape and I'll size it up - e.g. \"concrete for a 6x4 slab, 100mm thick\", \"tiles for a 4x3 room, 300x300\", or \"paint for a 5m x 2.4m wall, 2 coats\".");
+          return reply();
+        }
+        twiml.message(out);
+      } catch (err) {
+        console.error('Takeoff failed:', err);
+        twiml.message("Couldn't work that one out just now - give it another go with the dimensions (length, width, and thickness).");
       }
       return reply();
     }
