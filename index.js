@@ -81,6 +81,8 @@ function newUser() {
     step: 'waitingCode',
     pendingReminders: [], history: [],
     teamMembers: [],
+    clients: [], clientPhones: [],
+    reviewLink: '',
     // Feature toggles the builder can flip by texting Flow in plain English.
     preferences: {
       weeklySpecials: true,
@@ -116,6 +118,30 @@ function buildBusinessContext(user) {
     ", mainly working in " + user.workAreas + ". Work hours: " + user.workHours +
     ". Finish time: " + user.finishTime + ". Regular suppliers: " + user.suppliers +
     ". Biggest admin headache: " + user.adminHeadache + ".";
+}
+
+// Everything Flow actually has on file - crew, clients, tickets etc. - so he can
+// answer questions about them directly instead of drawing a blank. The boss only
+// ever sees their OWN data here (crew/clients never reach this prompt themselves).
+function summarizeForContext(user) {
+  const parts = [];
+  if (Array.isArray(user.crew) && user.crew.length) {
+    parts.push("Crew (employees) + mobiles: " + user.crew.slice(0, 25).map(function (c) { return c.name + " " + c.phone; }).join('; '));
+  }
+  if (Array.isArray(user.clients) && user.clients.length) {
+    parts.push("Clients + mobiles: " + user.clients.slice(0, 30).map(function (c) { return c.name + (c.job ? (" [" + c.job + "]") : "") + " " + c.phone; }).join('; '));
+  }
+  if (Array.isArray(user.compliance) && user.compliance.length) {
+    parts.push("Tickets/licences + expiry: " + user.compliance.slice(0, 25).map(function (c) { return c.label + " expires " + c.expiry; }).join('; '));
+  }
+  if (user.payDay) parts.push("Pays/timesheet roundup day: " + user.payDay);
+  if (user.reviewLink) parts.push("Google review link: on file");
+  if (Array.isArray(user.logbook) && user.logbook.length) {
+    const totalKm = user.logbook.reduce(function (s, e) { return s + (e && e.km ? e.km : 0); }, 0);
+    parts.push("Vehicle logbook: " + user.logbook.length + " trips, ~" + Math.round(totalKm) + " km logged");
+  }
+  if (!parts.length) return '';
+  return "\n\nWHAT YOU HAVE ON FILE FOR THIS BUSINESS (real saved data - answer from it directly, never say you don't know it):\n- " + parts.join("\n- ");
 }
 
 function generateCode() {
@@ -573,18 +599,30 @@ function wantsComplianceList(message) {
 
 // ----- Crew messaging: add crew with numbers, broadcast one message to all -----
 function normalizeAuMobile(raw) {
-  if (!raw) return null;
-  let d = ('' + raw).replace(/[^\d+]/g, '');
-  if (d.indexOf('+61') === 0) d = d.slice(3);
-  else if (d.indexOf('61') === 0 && d.length >= 11) d = d.slice(2);
-  else if (d.indexOf('0') === 0) d = d.slice(1);
-  if (/^4\d{8}$/.test(d)) return '+61' + d; // AU mobiles only
+  if (raw === null || raw === undefined) return null;
+  let d = ('' + raw).replace(/\D/g, ''); // digits only - drops +, spaces, dashes, dots, brackets
+  if (!d) return null;
+  if (d.indexOf('0061') === 0) d = d.slice(4);              // 0061 4xx xxx xxx
+  else if (d.indexOf('61') === 0 && d.length >= 11) d = d.slice(2); // 61 / +61 4xx...
+  else if (d.indexOf('0') === 0) d = d.slice(1);            // 04xx xxx xxx
+  if (/^4\d{8}$/.test(d)) return '+61' + d;                 // AU mobile = 9 digits starting with 4
   return null;
 }
 
+// Pull the first valid AU mobile out of a message, however it's written:
+// 0412345678, 0412 345 678, 0412-345-678, (0412) 345 678, +61 412 345 678,
+// 61412345678, "his number is 0412 345 678", etc. Returns the matched text.
 function findAuMobile(message) {
-  const m = (message || '').match(/(?:\+?61[\s-]?|0)?4(?:[\s-]?\d){8}\b/);
-  return m ? m[0] : null;
+  if (!message) return null;
+  const text = '' + message;
+  // a phone-ish run: optional +/(, then digits with spaces/dashes/dots/brackets, ending on a digit
+  const re = /\+?\(?\d[\d\s().\-]{6,15}\d/g;
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    if (normalizeAuMobile(m[0])) return m[0].trim();
+    re.lastIndex = m.index + 1; // candidate didn't validate - slide along and try again
+  }
+  return null;
 }
 
 function parseCrewAdd(message) {
@@ -603,7 +641,7 @@ function parseCrewAdd(message) {
     .replace(/\s+/g, ' ')
     .trim();
   if (name) name = name.split(' ').slice(0, 2).join(' ');
-  if (!name) name = 'crew member';
+  if (!name) name = '';
   return { name: name, phone: phone };
 }
 
@@ -622,8 +660,40 @@ function parseCrewBroadcast(message) {
 
 function wantsCrewList(message) {
   const lower = (message || '').toLowerCase();
-  return /\b(show|list|who'?s|who is|view)\b[^\n]*\b(crew|team)\b/.test(lower)
+  return /\b(show|list|who'?s|who is|view|what'?s|what are)\b[^\n]*\b(crew|team)\b/.test(lower)
+    || /\b(crew|team)\b[^\n]*\b(numbers?|phones?|mobiles?|contacts?)\b/.test(lower)
     || /^(my )?(crew|team)\??$/.test(lower.trim());
+}
+
+// "add Cayleb to the crew" but no number in the message -> we should ASK for it,
+// not silently fail. Returns the probable name (or '') when that's the situation.
+function crewAddMissingPhone(message) {
+  const lower = (message || '').toLowerCase();
+  if (findAuMobile(message)) return null; // a number is present - normal add handles it
+  if (!/\b(crew|team)\b/.test(lower)) return null;
+  if (!/\b(add|new|put|onboard|join|sign on|bring on|set up)\b/.test(lower)) return null;
+  let name = (message || '')
+    .replace(/\b(add|new|put|onboard|join|sign on|bring on|set up|to the|on the|crew member|crew|team|member|my|please|hey|flow|the|a|an|is)\b/gi, ' ')
+    .replace(/[^a-zA-Z '\-]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (name) name = name.split(' ').slice(0, 2).join(' ');
+  return { name: name || '' };
+}
+
+// Same idea for clients: clear intent to add a client but no number present.
+function clientAddMissingPhone(message) {
+  const lower = (message || '').toLowerCase();
+  if (findAuMobile(message)) return null;
+  if (!/\b(client|customer)\b/.test(lower)) return null;
+  if (!/\b(add|new|save|store|set up)\b/.test(lower)) return null;
+  let name = (message || '')
+    .replace(/\b(add|new|save|store|set up|client|customer|my|please|hey|flow|the|a|an|is|for|on|at)\b/gi, ' ')
+    .replace(/[^a-zA-Z '\-]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (name) name = name.split(' ').slice(0, 2).join(' ');
+  return { name: name || '' };
 }
 
 // Is this inbound number one of someone's saved crew members (an employee)?
@@ -644,6 +714,200 @@ async function findCrewMembership(phone) {
     const member = (Array.isArray(boss.crew) ? boss.crew : []).find(function (c) { return c && c.phone === phone; });
     return { bossPhone: doc.id, boss: boss, member: member || { name: '', phone: phone } };
   } catch (e) { console.error('Crew membership lookup failed:', e); return null; }
+}
+
+// ----- Client Updates: save clients, send them tidy job updates, route their replies -----
+
+// "add client Sarah 0412 345 678 for the Smith St job"
+function parseClientAdd(message) {
+  const lower = (message || '').toLowerCase();
+  const raw = findAuMobile(message);
+  if (!raw) return null;
+  const phone = normalizeAuMobile(raw);
+  if (!phone) return null;
+  if (!/\b(client|customer)\b/.test(lower)) return null;
+  if (!/\b(add|new|save|store|here'?s|this is|number|mobile|is)\b/.test(lower)) return null;
+
+  let work = (message || '').replace(raw, ' ');
+  let job = '';
+  const jm = work.match(/\b(?:for|on|at)\s+(?:the\s+)?([^,.]+?)(?:\s+(?:job|reno|build|site|place))?\s*$/i);
+  if (jm && jm[1] && jm[1].trim().length <= 40) { job = jm[1].trim(); work = work.replace(jm[0], ' '); }
+
+  let name = work
+    .replace(/\b(add|new|save|store|client|customer|number'?s?|mobile|is|the|a|an|please|hey|flow|this|here'?s)\b/gi, ' ')
+    .replace(/[^a-zA-Z '\-]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (name) name = name.split(' ').slice(0, 2).join(' ');
+  if (!name) name = '';
+  return { name: name, phone: phone, job: job };
+}
+
+// Pull a likely person's name out of a short reply ("Cayleb", "his name's Cayleb",
+// "call him Cayleb Smith"). Returns null if it doesn't look like a name.
+function extractPersonName(message) {
+  let s = (message || '').trim();
+  s = s.replace(/^(?:his|her|their)?\s*(?:name'?s?|name is|it'?s|its|call (?:him|her|them)|that'?s|he'?s|she'?s)\s+/i, '');
+  s = s.replace(/[^a-zA-Z '\-]/g, ' ').replace(/\s+/g, ' ').trim();
+  if (!s) return null;
+  const words = s.split(' ');
+  if (words.length > 3) return null; // too long to just be a name
+  if (/^(add|remove|tell|show|list|remind|cancel|yes|no|send|stop|update|the|crew|team|client|customer|ok|okay|nah|yep|cheers|thanks)$/i.test(words[0])) return null;
+  return words.slice(0, 2).map(function (w) { return w ? (w.charAt(0).toUpperCase() + w.slice(1)) : w; }).join(' ');
+}
+
+function parseClientRemove(message) {
+  let m = (message || '').match(/\b(?:remove|delete|drop|get rid of)\s+(?:the\s+)?client\s+(.+)$/i);
+  if (m && m[1]) return m[1].trim();
+  m = (message || '').match(/\b(?:remove|delete|drop)\s+(.+?)\s+from\s+(?:my\s+)?clients\b/i);
+  if (m && m[1]) return m[1].trim();
+  return null;
+}
+
+function wantsClientList(message) {
+  const lower = (message || '').toLowerCase();
+  return /\b(show|list|view|who are)\b[^\n]*\bclients?\b/.test(lower) || /^(my )?clients?\??$/.test(lower.trim());
+}
+
+// "tell Sarah we'll be there at 8" / "let the Smith St client know we're done".
+// Only fires when a known client is matched, so it won't hijack "tell me a joke".
+function parseClientUpdate(message, clients) {
+  const m = (message || '').match(/^\s*(?:hey\s+)?(?:flow[,\s]+)?(?:can you\s+)?(?:please\s+)?(?:tell|let|update|message|msg|text|notify|ping)\s+(.+)$/i);
+  if (!m) return null;
+  const rest = (m[1] || '').trim();
+  const rlow = rest.toLowerCase().replace(/^the\s+/, '');
+  const offset = rest.length - rlow.length; // chars trimmed off the front ("the ")
+  const list = Array.isArray(clients) ? clients : [];
+  let best = null;
+  for (const c of list) {
+    if (!c || !c.name) continue;
+    const nm = c.name.toLowerCase();
+    if (rlow.startsWith(nm) && (!best || nm.length > best.len)) best = { client: c, len: nm.length };
+  }
+  if (!best) {
+    for (const c of list) {
+      if (!c || !c.job) continue;
+      if (rlow.indexOf(c.job.toLowerCase()) !== -1) { best = { client: c, len: 0 }; break; }
+    }
+  }
+  if (!best) return null;
+  let content = rest.slice(offset + best.len).replace(/^(?:\s+|:|,|-|know|that|to)+/i, '').trim();
+  return { client: best.client, content: content };
+}
+
+// Which boss does this client number belong to (+ that client's record)?
+async function findClientOwner(phone) {
+  try {
+    const snap = await db.collection('users').where('clientPhones', 'array-contains', phone).limit(1).get();
+    if (snap.empty) return null;
+    const doc = snap.docs[0];
+    const boss = doc.data();
+    const client = (Array.isArray(boss.clients) ? boss.clients : []).find(function (c) { return c && c.phone === phone; });
+    return { bossPhone: doc.id, boss: boss, client: client || { name: '', phone: phone } };
+  } catch (e) { console.error('Client owner lookup failed:', e); return null; }
+}
+
+// Turn the boss's note into a tidy, professional SMS to the client. The LLM only
+// rewords - it's told not to invent times, prices or promises. Falls back to a
+// plain template if the model is unavailable.
+async function draftClientMessage(user, client, content) {
+  const sys = "You write ONE short, friendly, professional SMS from a tradie to their client. "
+    + "Keep ALL facts from the tradie's note exactly - never add or change times, dates, prices or promises. "
+    + "No emojis. One or two sentences. Start with the client's first name. "
+    + "End with the tradie's name on a new line as \"- <name>\".";
+  const fromName = user.name || '';
+  const userContent = "Client first name: " + (client.name || 'there')
+    + (fromName ? ("\nTradie's name: " + fromName) : "")
+    + (client.job ? ("\nJob: " + client.job) : "")
+    + "\nNote to convey: " + content;
+  try {
+    const resp = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      max_tokens: 120,
+      messages: [{ role: 'system', content: sys }, { role: 'user', content: userContent }]
+    });
+    const out = (resp.choices[0].message.content || '').trim();
+    if (out) return out;
+  } catch (e) { console.error('Client draft LLM failed:', e); }
+  const hi = client.name ? ("Hi " + client.name + ", ") : "Hi, ";
+  return hi + content + (fromName ? ("\n- " + fromName) : "");
+}
+
+// Find a saved client mentioned anywhere in a message (by name, else by job).
+function matchClientInText(text, clients) {
+  const lower = (text || '').toLowerCase();
+  const list = Array.isArray(clients) ? clients : [];
+  for (const c of list) {
+    if (c && c.name && lower.indexOf(c.name.toLowerCase()) !== -1) return c;
+  }
+  for (const c of list) {
+    if (c && c.job && c.job.length >= 3 && lower.indexOf(c.job.toLowerCase()) !== -1) return c;
+  }
+  return null;
+}
+
+// "my review link is https://g.page/r/..." -> the URL.
+function parseReviewLink(message) {
+  if (!/review/i.test(message || '')) return null;
+  const m = (message || '').match(/(https?:\/\/\S+|g\.page\/\S+|maps\.app\.goo\.gl\/\S+|search\.google\.com\/\S+)/i);
+  if (!m) return null;
+  let url = m[0].replace(/[).,]+$/, '');
+  if (!/^https?:\/\//i.test(url)) url = 'https://' + url;
+  return url;
+}
+
+// A polite, consistent Google-review request (templated, not AI - keep it predictable).
+function buildReviewRequest(user, client) {
+  const fromName = user.name || '';
+  const hi = client.name ? ("Hi " + client.name + ", ") : "Hi, ";
+  let body = hi + "thanks for having us" + (client.job ? (" for the " + client.job) : "")
+    + "! If you were happy with how it all went, a quick Google review would mean a lot - it really helps us out. Here's the link: " + (user.reviewLink || '');
+  if (fromName) body += "\n- " + fromName;
+  return body.trim();
+}
+
+// "Sarah's job is done" / "finished the Smith St job" -> the matched client (or null).
+// Ignores outbound phrasings ("tell/send Sarah ...") so it doesn't fire on those.
+function parseJobDone(message, clients) {
+  const lower = (message || '').toLowerCase();
+  if (!/\b(done|finished|finish(?:ed)? up|wrapped up|complete(?:d)?|all done|knocked over|signed off)\b/.test(lower)) return null;
+  if (/\b(tell|let|update|send|text|message|msg|notify|ping|ask|chase)\b/.test(lower)) return null;
+  return matchClientInText(message, clients);
+}
+
+// "ask Sarah for a review" / "get a review from the Smith St client".
+function parseReviewRequest(message, clients) {
+  const lower = (message || '').toLowerCase();
+  if (!/\breview\b/.test(lower)) return null;
+  if (!/\b(ask|request|send|get|chase|grab)\b/.test(lower)) return null;
+  return matchClientInText(message, clients);
+}
+
+// "running late to Sarah's" / "running 20 late for the Smith St job".
+function parseRunningLate(message, clients) {
+  const lower = (message || '').toLowerCase();
+  if (!/\b(running late|running behind|gonna be late|going to be late|i'?ll be late|be late|delayed|held up|behind schedule|running \d+)\b/.test(lower)) return null;
+  const client = matchClientInText(message, clients);
+  if (!client) return null;
+  const dm = lower.match(/(\d+)\s*(minutes|minute|mins|min|hours|hour|hrs|hr)\b/);
+  return { client: client, amount: dm ? dm[0] : null };
+}
+
+// "show Sarah's history" / "what did Sarah say" -> the matched client (or null).
+function parseClientHistoryRequest(message, clients) {
+  const lower = (message || '').toLowerCase();
+  if (!/\b(history|thread|conversation|latest|recent|what did|been saying|messages? with|said)\b/.test(lower)) return null;
+  return matchClientInText(message, clients);
+}
+
+// Log a message to a client's per-job thread (kept on the boss's doc, capped).
+function appendClientHistory(boss, phone, dir, body) {
+  const list = Array.isArray(boss.clients) ? boss.clients : [];
+  const c = list.find(function (x) { return x && x.phone === phone; });
+  if (!c) return;
+  if (!Array.isArray(c.history)) c.history = [];
+  c.history.push({ dir: dir, body: body, at: new Date().toISOString() });
+  if (c.history.length > 50) c.history = c.history.slice(-50);
 }
 
 // ----- Timesheets: crew text "on site"/"knocked off"/"7 to 3"; Flow builds the sheet -----
@@ -1756,6 +2020,32 @@ app.post('/sms', async function(req, res) {
       }
     }
 
+    // ===== Client replies =====
+    // A saved client texting back. Like crew, clients NEVER reach the AI or any
+    // business data - their reply is forwarded to the boss and they get a brief ack.
+    if (!user.onboarded) {
+      const owner = await findClientOwner(userPhone);
+      if (owner) {
+        const cname = owner.client.name || 'A client';
+        try {
+          await twilioClient.messages.create({
+            body: cname + " replied: \"" + userMessage.trim() + "\""
+              + (owner.client.job ? (" (" + owner.client.job + ")") : "")
+              + "\n\nReply \"tell " + (owner.client.name || cname) + " ...\" to answer.",
+            from: process.env.TWILIO_PHONE_NUMBER,
+            to: owner.bossPhone
+          });
+        } catch (e) { console.error('Client reply forward failed:', e); }
+        try {
+          appendClientHistory(owner.boss, userPhone, 'in', userMessage.trim());
+          await db.collection('users').doc(owner.bossPhone).update({ clients: owner.boss.clients });
+        } catch (e) { console.error('Client history save failed:', e); }
+        const hi = owner.client.name ? ("Thanks " + owner.client.name + ", ") : "Thanks, ";
+        twiml.message(hi + "I've passed that on.");
+        return reply();
+      }
+    }
+
     if (user.step === 'waitingCode' || user.step === 'welcome') {
       const entered = userMessage.trim();
       const codeDoc = await db.collection('access_codes').doc(entered).get();
@@ -1827,6 +2117,70 @@ app.post('/sms', async function(req, res) {
           return reply();
         }
       }
+    }
+
+    // Flow asked for a name to finish saving a crew member or client.
+    if (user.pendingCrewName && user.pendingCrewName.phone) {
+      const nm = extractPersonName(userMessage);
+      if (nm) {
+        const phone = user.pendingCrewName.phone;
+        user.pendingCrewName = null;
+        if (!Array.isArray(user.crew)) user.crew = [];
+        const existing = user.crew.find(function (c) { return c && c.phone === phone; });
+        if (existing) existing.name = nm;
+        else user.crew.push({ name: nm, phone: phone });
+        user.crewPhones = user.crew.map(function (c) { return c.phone; }).filter(Boolean);
+        await saveUser(userPhone, user);
+        twiml.message("Added " + nm + " to your crew (" + phone + "). That's " + user.crew.length + " on the crew.");
+        return reply();
+      }
+      user.pendingCrewName = null; // not a name - drop it and handle normally
+      await saveUser(userPhone, user);
+    }
+    if (user.pendingClientName && user.pendingClientName.phone) {
+      const nm = extractPersonName(userMessage);
+      if (nm) {
+        const pend = user.pendingClientName;
+        user.pendingClientName = null;
+        if (!Array.isArray(user.clients)) user.clients = [];
+        const existing = user.clients.find(function (c) { return c && c.phone === pend.phone; });
+        if (existing) { existing.name = nm; if (pend.job) existing.job = pend.job; }
+        else user.clients.push({ name: nm, phone: pend.phone, job: pend.job || '', addedAt: new Date().toISOString() });
+        user.clientPhones = user.clients.map(function (c) { return c.phone; }).filter(Boolean);
+        await saveUser(userPhone, user);
+        twiml.message("Saved " + nm + " (" + pend.phone + ")" + (pend.job ? " for " + pend.job : "") + ". Say \"tell " + nm + " ...\" to send them an update.");
+        return reply();
+      }
+      user.pendingClientName = null;
+      await saveUser(userPhone, user);
+    }
+
+    // A client update is drafted and waiting on the boss's "SEND".
+    if (user.pendingClientMsg && user.pendingClientMsg.phone) {
+      const ans = userMessage.trim().toLowerCase();
+      if (/^(send|yes|yep|yeah|yup|go|ok|okay|sure|do it|send it|confirm|sounds good)\b/.test(ans)) {
+        const p = user.pendingClientMsg;
+        user.pendingClientMsg = null;
+        appendClientHistory(user, p.phone, 'out', p.body);
+        await saveUser(userPhone, user);
+        try {
+          await twilioClient.messages.create({ body: p.body, from: process.env.TWILIO_PHONE_NUMBER, to: p.phone });
+          twiml.message("Done - sent to " + (p.name || 'your client') + ".");
+        } catch (e) {
+          console.error('Client send failed:', e);
+          twiml.message("Couldn't get that through to " + (p.name || 'your client') + " just now - try again in a sec.");
+        }
+        return reply();
+      }
+      if (/^(cancel|no|nah|stop|don'?t|forget it|scrap|leave it)\b/.test(ans)) {
+        user.pendingClientMsg = null;
+        await saveUser(userPhone, user);
+        twiml.message("No worries - didn't send it.");
+        return reply();
+      }
+      // Neither send nor cancel: drop the stale draft and handle this message normally.
+      user.pendingClientMsg = null;
+      await saveUser(userPhone, user);
     }
 
     // Incoming photo (MMS)? Read it with vision and short-circuit here.
@@ -2071,6 +2425,13 @@ app.post('/sms', async function(req, res) {
     // Crew messaging: add crew (with number), remove, broadcast to all, or list.
     const crewAdd = parseCrewAdd(userMessage);
     if (crewAdd) {
+      if (!crewAdd.name) {
+        // Got a number but no name - ask, and hold the number ready.
+        user.pendingCrewName = { phone: crewAdd.phone };
+        await saveUser(userPhone, user);
+        twiml.message("No worries - what's their name? I'll add them to the crew on " + crewAdd.phone + ".");
+        return reply();
+      }
       if (!Array.isArray(user.crew)) user.crew = [];
       const existing = user.crew.find(function (c) { return c && c.phone === crewAdd.phone; });
       if (existing) existing.name = crewAdd.name;
@@ -2079,6 +2440,16 @@ app.post('/sms', async function(req, res) {
       await saveUser(userPhone, user);
       twiml.message("Added " + crewAdd.name + " to your crew (" + crewAdd.phone + "). Now you can say \"tell the crew ...\" and I'll message everyone at once. That's " + user.crew.length + " on the crew.");
       return reply();
+    }
+
+    // Crew-add intent but no number in the message -> ask for it instead of failing.
+    {
+      const needCrewPhone = crewAddMissingPhone(userMessage);
+      if (needCrewPhone) {
+        const who = needCrewPhone.name || "them";
+        twiml.message("Happy to add " + who + " to the crew - what's " + (needCrewPhone.name ? (needCrewPhone.name + "'s") : "their") + " mobile number?");
+        return reply();
+      }
     }
 
     const crewRemoveName = parseCrewRemove(userMessage);
@@ -2127,6 +2498,157 @@ app.post('/sms', async function(req, res) {
       const lines = crew.slice(0, 20).map(function (c) { return "- " + c.name + " (" + c.phone + ")"; });
       twiml.message("Your crew (" + crew.length + "):\n" + lines.join('\n') + "\nSay \"tell the crew ...\" to message them all.");
       return reply();
+    }
+
+    // ----- Client Updates -----
+    // Add a client: "add client Sarah 0412 345 678 for the Smith St job"
+    const clientAdd = parseClientAdd(userMessage);
+    if (clientAdd) {
+      if (!clientAdd.name) {
+        user.pendingClientName = { phone: clientAdd.phone, job: clientAdd.job || '' };
+        await saveUser(userPhone, user);
+        twiml.message("No worries - what's the client's name? I'll save them on " + clientAdd.phone + (clientAdd.job ? " for " + clientAdd.job : "") + ".");
+        return reply();
+      }
+      if (!Array.isArray(user.clients)) user.clients = [];
+      const existing = user.clients.find(function (c) { return c && c.phone === clientAdd.phone; });
+      if (existing) { existing.name = clientAdd.name; if (clientAdd.job) existing.job = clientAdd.job; }
+      else user.clients.push({ name: clientAdd.name, phone: clientAdd.phone, job: clientAdd.job || '', addedAt: new Date().toISOString() });
+      user.clientPhones = user.clients.map(function (c) { return c.phone; }).filter(Boolean);
+      await saveUser(userPhone, user);
+      twiml.message("Saved " + clientAdd.name + " (" + clientAdd.phone + ")" + (clientAdd.job ? " for " + clientAdd.job : "") + ". Now you can say \"tell " + clientAdd.name + " ...\" and I'll send them a tidy update - I'll always show you the wording first.");
+      return reply();
+    }
+
+    // Client-add intent but no number -> ask for it instead of failing.
+    {
+      const needClientPhone = clientAddMissingPhone(userMessage);
+      if (needClientPhone) {
+        const who = needClientPhone.name || "them";
+        twiml.message("Sure - what's " + (needClientPhone.name ? (needClientPhone.name + "'s") : "the client's") + " mobile number? I'll save " + who + " so I can send them updates.");
+        return reply();
+      }
+    }
+
+    // Remove a client
+    const clientRemoveName = parseClientRemove(userMessage);
+    if (clientRemoveName) {
+      const clients = Array.isArray(user.clients) ? user.clients : [];
+      const idx = clients.findIndex(function (c) { return c && c.name && c.name.toLowerCase().indexOf(clientRemoveName.toLowerCase()) !== -1; });
+      if (idx === -1) {
+        twiml.message("Couldn't find a client called \"" + clientRemoveName + "\". Say \"show my clients\" to see who's saved.");
+        return reply();
+      }
+      const removed = clients[idx].name;
+      clients.splice(idx, 1);
+      user.clients = clients;
+      user.clientPhones = clients.map(function (c) { return c.phone; }).filter(Boolean);
+      await saveUser(userPhone, user);
+      twiml.message("Removed " + removed + " from your clients. " + clients.length + " left.");
+      return reply();
+    }
+
+    // List clients
+    if (wantsClientList(userMessage)) {
+      const clients = Array.isArray(user.clients) ? user.clients : [];
+      if (!clients.length) {
+        twiml.message("No clients saved yet. Add one like \"add client Sarah 0412 345 678 for the Smith St job\".");
+        return reply();
+      }
+      const lines = clients.slice(0, 20).map(function (c) { return "- " + c.name + (c.job ? (" (" + c.job + ")") : "") + " - " + c.phone; });
+      twiml.message("Your clients (" + clients.length + "):\n" + lines.join('\n') + "\nSay \"tell <name> ...\" to send an update.");
+      return reply();
+    }
+
+    // Send a client update: "tell Sarah we'll be there at 8" -> draft + confirm.
+    {
+      const upd = parseClientUpdate(userMessage, user.clients);
+      if (upd) {
+        if (!upd.content) {
+          twiml.message("What should I tell " + upd.client.name + "?");
+          return reply();
+        }
+        const body = await draftClientMessage(user, upd.client, upd.content);
+        user.pendingClientMsg = { phone: upd.client.phone, name: upd.client.name, body: body };
+        await saveUser(userPhone, user);
+        twiml.message("Here's what I'll send " + upd.client.name + ":\n\n\"" + body + "\"\n\nReply SEND to send it, or CANCEL.");
+        return reply();
+      }
+    }
+
+    // Set the Google review link: "my review link is https://g.page/r/..."
+    {
+      const link = parseReviewLink(userMessage);
+      if (link) {
+        user.reviewLink = link;
+        await saveUser(userPhone, user);
+        twiml.message("Saved your review link. When you mark a job done (e.g. \"Sarah's job is done\"), I'll offer to ask that client for a Google review.");
+        return reply();
+      }
+    }
+
+    // "running late to Sarah's" -> draft a reassuring heads-up + confirm.
+    {
+      const late = parseRunningLate(userMessage, user.clients);
+      if (late) {
+        const content = "Running " + (late.amount ? (late.amount + " ") : "a bit ") + "late"
+          + (late.client.job ? (" to the " + late.client.job) : "") + ".";
+        const body = await draftClientMessage(user, late.client, content);
+        user.pendingClientMsg = { phone: late.client.phone, name: late.client.name, body: body };
+        await saveUser(userPhone, user);
+        twiml.message("Here's a heads-up for " + late.client.name + ":\n\n\"" + body + "\"\n\nReply SEND to send it, or CANCEL.");
+        return reply();
+      }
+    }
+
+    // Job marked done -> offer to ask that client for a Google review.
+    {
+      const doneClient = parseJobDone(userMessage, user.clients);
+      if (doneClient) {
+        if (user.reviewLink) {
+          const body = buildReviewRequest(user, doneClient);
+          user.pendingClientMsg = { phone: doneClient.phone, name: doneClient.name, body: body };
+          await saveUser(userPhone, user);
+          twiml.message("Nice one. Want me to ask " + doneClient.name + " for a Google review? Here's the message:\n\n\"" + body + "\"\n\nReply SEND to send it, or CANCEL.");
+        } else {
+          let m = "Nice one - marked " + doneClient.name + "'s job done.";
+          if (!user.reviewTipSent) {
+            m += " Tip: send me your Google review link (\"my review link is https://...\") and I'll offer to ask clients for a review whenever you finish a job.";
+            user.reviewTipSent = true;
+            await saveUser(userPhone, user);
+          }
+          twiml.message(m);
+        }
+        return reply();
+      }
+    }
+
+    // "ask Sarah for a review" -> review request + confirm.
+    {
+      const revClient = parseReviewRequest(userMessage, user.clients);
+      if (revClient) {
+        if (!user.reviewLink) {
+          twiml.message("Send me your Google review link first - e.g. \"my review link is https://g.page/r/...\". Then I can ask " + revClient.name + " for a review.");
+          return reply();
+        }
+        const body = buildReviewRequest(user, revClient);
+        user.pendingClientMsg = { phone: revClient.phone, name: revClient.name, body: body };
+        await saveUser(userPhone, user);
+        twiml.message("Here's the review request for " + revClient.name + ":\n\n\"" + body + "\"\n\nReply SEND to send it, or CANCEL.");
+        return reply();
+      }
+    }
+
+    // "show Sarah's history" / "what did Sarah say" -> the recent thread.
+    {
+      const histClient = parseClientHistoryRequest(userMessage, user.clients);
+      if (histClient) {
+        const h = Array.isArray(histClient.history) ? histClient.history.slice(-8) : [];
+        if (!h.length) { twiml.message("No messages with " + histClient.name + " yet."); return reply(); }
+        const lines = h.map(function (e) { return (e.dir === 'in' ? (histClient.name + ": ") : "You: ") + (e.body || '').replace(/\s*\n+\s*/g, ' '); });
+        twiml.message("Recent with " + histClient.name + (histClient.job ? (" (" + histClient.job + ")") : "") + ":\n" + lines.join('\n'));
+        return reply();
+      }
     }
 
     // "I do pays on Thursday" - set which day Flow sends the weekly roundup.
@@ -2375,7 +2897,7 @@ app.post('/sms', async function(req, res) {
       ? "\nThis user has connected Xero. You CAN see their invoices and money owed - if they ask about cash, invoices, or who owes them, that is handled live elsewhere, so just answer naturally and never say you can't access their accounts."
       : "\nThis user has NOT connected Xero yet. If they ask about invoices or money owed, tell them you can pull it from Xero once it's connected and that they can text 'connect Xero' to set it up.";
 
-    const systemPrompt = "You are Flow, an AI assistant built specifically for Australian construction business owners.\n\nVOICE:\n- Talk like a real person - warm, easy and natural, the way a sharp offsider would text. Professional, but never robotic, formal, or full of corporate fluff.\n- Vary how you reply. Never lean on the same stock phrase, and always put things in your own words. Acknowledge what they actually said.\n- Keep replies short and texty by default - a sentence or two. Use a little more room only when you genuinely need to ask something or explain.\n- Never mention ChatGPT or OpenAI. Always refer to yourself as Flow.\n- Never say you cannot access the internet.\n- Australian spelling and dollars.\n- Always use the user's work areas and state for location based questions.\n- You know their regular suppliers and their biggest admin headache. Reference suppliers by name when ordering or prices come up, and look for natural chances to ease that admin pain.\n\nGETTING TASKS RIGHT (this is critical - getting it exactly right matters far more than being quick):\n- Before you act on ANY task, make sure you have every detail you'd need to do it exactly the way they want. If there's any meaningful uncertainty, anything missing, or anything that could be done more than one way, ASK before you do it. When in doubt, ask - it is always better to ask one more question than to get it wrong or only half right.\n- Don't assume, and don't fill gaps with your best guess. The only things you can take as given are details they've already told you or that are in their profile.\n- Ask EVERY question you need to nail the task - but group them all into ONE message so they can answer in one go. Never drip-feed questions one at a time across several texts.\n- For example: a reminder needs the exact time, the date if it isn't today, and who it involves; chasing a quote needs which job, who the client is, the amount, and the tone or wording they want; a job ad needs the role, area, pay, hours, start date, and how to apply; placing or chasing an order needs the item, quantity, supplier, and when it's needed by.\n- After they answer, read the key details back in plain English and only then do the task - so they get the chance to correct you before it's done.\n- ALWAYS reply with a real, human sentence. Never reply with only hidden tags - even when you're just noting something down, say something natural back.\n\nWhen search results are provided you MUST use them.\n\nFor each reminder with a clear time, confirm briefly then add it on its OWN new line: REMINDER: [task] | [time]. If they ask for several reminders in one message, output a separate REMINDER: line for every one.\n\nIf the user asks for something you genuinely cannot do, respond warmly in one or two sentences, tell them it is not a current feature, then add on its OWN new line exactly:\nFEATURE_REQUEST: [what they asked for]\n\nAs you chat, quietly learn about the business. When you learn something genuinely new (not already listed below), add it on its OWN new line at the very end of your reply using these tags - do not repeat a tag for something already known:\nLEARN_TEAM: [name] | [role]\nLEARN_SUPPLIER: [name] | [category]\nLEARN_CLIENT: [name] | [notes]\nLEARN_NOTE: [fact]\nLEARN_LEAD: [job or client] | [detail]\nUse LEARN_LEAD when they mention a possible job, enquiry, or quote that hasn't been won yet (e.g. someone asked them to price a job). Also: when they tell you their name or what to call them, add on its own line LEARN_NAME: [name]. These tags are stripped before the user sees the message, so keep them off the lines the user reads.\n\nWhen the user mentions a person's name you don't recognise from the team list, after completing their request ask: 'Is [name] part of your team? I can keep track of them for you.'\n\nUser profile: " + user.businessContext + teamContext + knowledgeContext + integrationsContext + "\nName: " + user.name + "\nState: " + user.state + "\nWork areas: " + user.workAreas + "\nWork hours: " + user.workHours + "\nFinish time: " + user.finishTime + "\nRegular suppliers: " + user.suppliers + "\nBiggest admin headache: " + user.adminHeadache + "\nLocal time: " + new Date().toLocaleString('en-AU', { timeZone: userTz }) + searchContext;
+    const systemPrompt = "You are Flow, an AI assistant built specifically for Australian construction business owners.\n\nVOICE:\n- Talk like a real person - warm, easy and natural, the way a sharp offsider would text. Professional, but never robotic, formal, or full of corporate fluff.\n- Vary how you reply. Never lean on the same stock phrase, and always put things in your own words. Acknowledge what they actually said.\n- Keep replies short and texty by default - a sentence or two. Use a little more room only when you genuinely need to ask something or explain.\n- Never mention ChatGPT or OpenAI. Always refer to yourself as Flow.\n- Never say you cannot access the internet.\n- Australian spelling and dollars.\n- Always use the user's work areas and state for location based questions.\n- You know their regular suppliers and their biggest admin headache. Reference suppliers by name when ordering or prices come up, and look for natural chances to ease that admin pain.\n\nGETTING TASKS RIGHT (this is critical - getting it exactly right matters far more than being quick):\n- Before you act on ANY task, make sure you have every detail you'd need to do it exactly the way they want. If there's any meaningful uncertainty, anything missing, or anything that could be done more than one way, ASK before you do it. When in doubt, ask - it is always better to ask one more question than to get it wrong or only half right.\n- Don't assume, and don't fill gaps with your best guess. The only things you can take as given are details they've already told you or that are in their profile.\n- Ask EVERY question you need to nail the task - but group them all into ONE message so they can answer in one go. Never drip-feed questions one at a time across several texts.\n- For example: a reminder needs the exact time, the date if it isn't today, and who it involves; chasing a quote needs which job, who the client is, the amount, and the tone or wording they want; a job ad needs the role, area, pay, hours, start date, and how to apply; placing or chasing an order needs the item, quantity, supplier, and when it's needed by.\n- After they answer, read the key details back in plain English and only then do the task - so they get the chance to correct you before it's done.\n- To actually SAVE a crew member or a client, you need their mobile number. If they ask you to add someone and you can't see a number in their message, ASK for it - never say you've added someone when you haven't.\n- Be curious about their business and complete the picture fast. If they give you half of something - a number with no name, a client with no job, a person with no role, a supplier with no category, a job with no address - ask the ONE quick question that fills the gap, then save it. One short question, never an interrogation. The better you understand their business, the more useful you are to them.\n- ALWAYS reply with a real, human sentence. Never reply with only hidden tags - even when you're just noting something down, say something natural back.\n\nWhen search results are provided you MUST use them.\n\nFor each reminder with a clear time, confirm briefly then add it on its OWN new line: REMINDER: [task] | [time]. If they ask for several reminders in one message, output a separate REMINDER: line for every one.\n\nIf the user asks for something you genuinely cannot do, respond warmly in one or two sentences, tell them it is not a current feature, then add on its OWN new line exactly:\nFEATURE_REQUEST: [what they asked for]\n\nAs you chat, quietly learn about the business. When you learn something genuinely new (not already listed below), add it on its OWN new line at the very end of your reply using these tags - do not repeat a tag for something already known:\nLEARN_TEAM: [name] | [role]\nLEARN_SUPPLIER: [name] | [category]\nLEARN_CLIENT: [name] | [notes]\nLEARN_NOTE: [fact]\nLEARN_LEAD: [job or client] | [detail]\nUse LEARN_LEAD when they mention a possible job, enquiry, or quote that hasn't been won yet (e.g. someone asked them to price a job). Also: when they tell you their name or what to call them, add on its own line LEARN_NAME: [name]. These tags are stripped before the user sees the message, so keep them off the lines the user reads.\n\nWhen the user mentions a person's name you don't recognise from the team list, after completing their request ask: 'Is [name] part of your team? I can keep track of them for you.'\n\nUser profile: " + user.businessContext + teamContext + knowledgeContext + summarizeForContext(user) + integrationsContext + "\nName: " + user.name + "\nState: " + user.state + "\nWork areas: " + user.workAreas + "\nWork hours: " + user.workHours + "\nFinish time: " + user.finishTime + "\nRegular suppliers: " + user.suppliers + "\nBiggest admin headache: " + user.adminHeadache + "\nLocal time: " + new Date().toLocaleString('en-AU', { timeZone: userTz }) + searchContext;
 
     const response = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
