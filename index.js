@@ -169,6 +169,13 @@ function localWeekdayHour(tz) {
   return { weekday: parts.weekday, hour: hour };
 }
 
+// Local calendar date ("YYYY-MM-DD") in a timezone, for "is this today?" checks.
+function localDateKey(tz, date) {
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit'
+  }).format(date || new Date());
+}
+
 function parseAuTime(text, tz) {
   const now = new Date();
   return chrono.parseDate(
@@ -251,6 +258,45 @@ function searchWeb(query) {
     });
 
     req.on('error', function() { resolve('Search unavailable.'); });
+    req.end();
+  });
+}
+
+// Like searchWeb, but returns structured results WITH urls so Flow can send links.
+function searchWebLinks(query) {
+  return new Promise(function(resolve) {
+    const encodedQuery = encodeURIComponent(query);
+    const options = {
+      hostname: 'api.search.brave.com',
+      path: '/res/v1/web/search?q=' + encodedQuery + '&count=8',
+      method: 'GET',
+      headers: { 'Accept': 'application/json', 'X-Subscription-Token': process.env.BRAVE_API_KEY }
+    };
+    const req = https.request(options, function(res) {
+      let chunks = [];
+      res.on('data', function(chunk) { chunks.push(chunk); });
+      res.on('end', function() {
+        try {
+          const buffer = Buffer.concat(chunks);
+          const encoding = res.headers['content-encoding'];
+          function processData(data) {
+            try {
+              const parsed = JSON.parse(data.toString());
+              const results = (parsed.web && parsed.web.results) ? parsed.web.results : [];
+              resolve(results.slice(0, 6).map(function(r) {
+                return { title: r.title || '', url: r.url || '', description: r.description || '' };
+              }).filter(function(r) { return r.url; }));
+            } catch (e) { resolve([]); }
+          }
+          if (encoding === 'gzip') {
+            zlib.gunzip(buffer, function(err, decoded) { if (!err) processData(decoded); else resolve([]); });
+          } else if (encoding === 'deflate') {
+            zlib.inflate(buffer, function(err, decoded) { if (!err) processData(decoded); else resolve([]); });
+          } else { processData(buffer); }
+        } catch (e) { resolve([]); }
+      });
+    });
+    req.on('error', function() { resolve([]); });
     req.end();
   });
 }
@@ -349,6 +395,44 @@ function wantsCancelReminder(message) {
   const lower = (message || '').toLowerCase();
   return /\b(cancel|delete|remove|clear|scrap|drop)\b[^\n]*\breminders?\b/.test(lower)
     || /\bforget (the |my )?reminder/.test(lower);
+}
+
+// "morning briefing", "brief me", "what have I got on today", "rundown"...
+function wantsBriefing(message) {
+  const lower = (message || '').toLowerCase();
+  return /\bbriefing\b/.test(lower)
+    || /\b(morning|daily) brief\b/.test(lower)
+    || /\bbrief me\b/.test(lower)
+    || /\brun ?down\b/.test(lower)
+    || /\bsitrep\b/.test(lower)
+    || /\bwhat(?:'?s| have i got| do i have)\b[^\n]*\btoday\b/.test(lower)
+    || /^(my day|the plan|today)\??$/.test(lower.trim());
+}
+
+// "plan for today: ...", "today's plan ...", "my plan today ..."
+function parseTodaysPlan(message) {
+  const m = (message || '').match(/^(?:my )?(?:plan\s+(?:for\s+)?today|today'?s\s+plan|todays\s+plan|plan\s+today)\b[:\-\s]*(.*)/i);
+  if (m && m[1] && m[1].trim().length > 1) return m[1].trim();
+  return null;
+}
+
+// "cheapest 90/45 near me", "best price on villaboard", "where can I buy..."
+function wantsPriceCheck(message) {
+  const lower = (message || '').toLowerCase();
+  return /\bcheapest\b/.test(lower)
+    || /\bbest (price|deal|deals)\b/.test(lower)
+    || /\bprices? (of|on|for|near)\b/.test(lower)
+    || /\bhow much (is|are|does|do)\b/.test(lower)
+    || /\bwhere (can i (buy|get)|to buy|to get)\b/.test(lower);
+}
+
+// Strip the shopping intent words to leave the product itself.
+function extractProductQuery(message) {
+  return (message || '')
+    .replace(/\b(cheapest|best price|best deal|best deals|prices?|price of|how much (is|are|does|do)|where (can i (buy|get)|to buy|to get)|near me|around me|close to me|for me|please|find me|the|a|an|some)\b/gi, ' ')
+    .replace(/\?/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 
 // Log anything Flow can't do yet so the team can see what people are asking for.
@@ -675,6 +759,72 @@ async function buildEveningAlert(user) {
   } catch (e) { console.error('Evening alert LLM failed:', e); return null; }
   if (!body) return null;
   return { body: body, geo: geo };
+}
+
+// Assemble an on-demand morning briefing from what Flow already tracks for this
+// user: today's reminders, open quotes/jobs, a plan they've texted in, and the
+// day's weather. Returns a short message, or null if there is genuinely nothing.
+async function buildBriefing(user, phone, tz) {
+  const todayKey = localDateKey(tz);
+
+  let reminderLines = [];
+  try {
+    const ups = await getUpcomingReminders(phone);
+    reminderLines = ups
+      .filter(function (r) { return localDateKey(tz, r.time) === todayKey; })
+      .map(function (r) {
+        return r.task + ' at ' + r.time.toLocaleString('en-AU', { hour: '2-digit', minute: '2-digit', timeZone: tz });
+      });
+  } catch (e) { /* skip reminders on error */ }
+
+  let leadLines = [];
+  if (user.knowledge && Array.isArray(user.knowledge.leads)) {
+    leadLines = user.knowledge.leads
+      .filter(function (l) { return l && l.status !== 'closed' && l.label; })
+      .slice(0, 5)
+      .map(function (l) { return l.label; });
+  }
+
+  let plan = '';
+  if (user.todaysPlan && user.todaysPlan.date === todayKey && user.todaysPlan.text) plan = user.todaysPlan.text;
+
+  let weatherLine = '';
+  try {
+    const geo = await geocodeForUser(user);
+    if (geo) {
+      const fc = await fetchForecast(geo);
+      if (fc && fc.today) {
+        const t = fc.today;
+        weatherLine = wmoText(t.code) + ', ' + Math.round(t.tmin) + ' to ' + Math.round(t.tmax) + ' degrees' +
+          (t.rainProb != null ? (', ' + t.rainProb + '% chance of rain') : '');
+      }
+    }
+  } catch (e) { /* skip weather on error */ }
+
+  if (!reminderLines.length && !leadLines.length && !plan && !weatherLine) return null;
+
+  const data =
+    "Plan for today: " + (plan || 'not given') + "\n" +
+    "Reminders today: " + (reminderLines.length ? reminderLines.join('; ') : 'none') + "\n" +
+    "Open quotes/jobs to chase: " + (leadLines.length ? leadLines.join('; ') : 'none') + "\n" +
+    "Weather today: " + (weatherLine || 'unavailable');
+
+  const sys = "You are Flow, an Australian tradie's assistant giving a SHORT on-demand morning briefing by text. " +
+    "Greet them by name once, then a tight, scannable rundown using ONLY the data below - never invent anything. " +
+    "Give a short line each for their plan, reminders, quotes/jobs to chase, and a few words on the weather. SKIP anything marked none / not given / unavailable instead of mentioning it. " +
+    "Warm, natural, Australian. No hashtags, no emojis. Finish with a brief offer such as 'Want me to add anything?'. Do not add any labels, tags, or sign-off.";
+  const userContent = "Name: " + (user.name || 'mate') + "\n" + data;
+
+  let body;
+  try {
+    const resp = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      max_tokens: 170,
+      messages: [{ role: 'system', content: sys }, { role: 'user', content: userContent }]
+    });
+    body = (resp.choices[0].message.content || '').trim();
+  } catch (e) { console.error('Briefing LLM failed:', e); return null; }
+  return body || null;
 }
 
 // ============================ SCHEDULERS ============================
@@ -1256,6 +1406,52 @@ app.post('/sms', async function(req, res) {
         console.error('Hiring helper failed:', err);
         twiml.message("Couldn't draft that just now - try me again in a moment.");
       }
+      return reply();
+    }
+
+    // "Cheapest 90/45 near me" - search the web and send a few buying links.
+    if (wantsPriceCheck(userMessage)) {
+      try {
+        const product = extractProductQuery(userMessage) || userMessage;
+        const area = user.workAreas || user.state || 'Australia';
+        const links = await searchWebLinks(product + ' price buy ' + area + ' Australia');
+        if (!links || !links.length) {
+          twiml.message("Couldn't pull up prices for that just now - give it another go in a sec, or tell me a bit more (size, material, your suburb).");
+          return reply();
+        }
+        const resultsText = links.map(function (r, i) {
+          return (i + 1) + '. ' + r.title + ' | ' + r.url + (r.description ? (' | ' + r.description) : '');
+        }).join('\n');
+        const resp = await openai.chat.completions.create({
+          model: 'gpt-4o-mini', max_tokens: 280,
+          messages: [
+            { role: 'system', content: "You are Flow, helping an Australian tradie find the cheapest place to buy a building material or product near " + area + ". From the web results below (each line is: number. title | url | description), pick the 2-3 best BUYING options - favour retailers/suppliers that actually sell the item. For each, write ONE line: retailer or product name, the price ONLY if it is clearly stated in the result, then the link on the same line. Put the cheapest first when prices are shown. Australian spelling and dollars. NEVER invent, estimate, or round a price - only use figures clearly present in the results; if a result has no price, just give the name and link. Keep it short and texty. If none look like genuine buying options, say you couldn't find solid pricing and ask them to add detail (size, material, suburb). Do not add labels, tags, or a sign-off." },
+            { role: 'user', content: 'They asked: ' + userMessage + '\nProduct: ' + product + '\n\nResults:\n' + resultsText }
+          ]
+        });
+        let pick = (resp.choices[0].message.content || '').trim();
+        if (!pick) pick = "Couldn't find solid pricing on that one - give me a touch more detail (size, material, your suburb) and I'll have another crack.";
+        twiml.message(pick);
+      } catch (err) {
+        console.error('Price check failed:', err);
+        twiml.message("Couldn't run that price search just now - give it another go in a moment.");
+      }
+      return reply();
+    }
+
+    // Capture a plan for today ("plan for today: ...")
+    const todaysPlanText = parseTodaysPlan(userMessage);
+    if (todaysPlanText) {
+      user.todaysPlan = { text: todaysPlanText, date: localDateKey(userTz) };
+      await saveUser(userPhone, user);
+      twiml.message("Got your plan for today locked in. Ask me for a briefing anytime and I'll run it back with your reminders and anything on the go.");
+      return reply();
+    }
+
+    // Morning briefing on demand
+    if (wantsBriefing(userMessage)) {
+      const brief = await buildBriefing(user, userPhone, userTz);
+      twiml.message(brief || ("All clear " + (user.name || 'mate') + " - nothing on my radar today. Tell me what's on and I'll keep you on track."));
       return reply();
     }
 
