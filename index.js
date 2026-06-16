@@ -79,7 +79,7 @@ function newUser() {
     suppliers: '', adminHeadache: '',
     businessContext: '', onboarded: false,
     step: 'waitingCode',
-    pendingReminderTask: '', history: [],
+    pendingReminders: [], history: [],
     teamMembers: [],
     // Feature toggles the builder can flip by texting Flow in plain English.
     preferences: {
@@ -290,6 +290,11 @@ function backfillUser(user) {
   if (typeof user.signupAt === 'undefined') user.signupAt = null;
   if (!Array.isArray(user.firstWeekAsked)) user.firstWeekAsked = [];
   if (!user.integrations) user.integrations = { xero: null, gmail: null };
+  if (!Array.isArray(user.pendingReminders)) {
+    user.pendingReminders = (user.pendingReminderTask && user.pendingReminderTask !== '')
+      ? [user.pendingReminderTask] : [];
+  }
+  delete user.pendingReminderTask;
 }
 
 async function saveUser(phone, user) {
@@ -315,6 +320,35 @@ async function getPendingReminders() {
 
 async function markReminderSent(id) {
   await db.collection('reminders').doc(id).update({ sent: true });
+}
+
+// All not-yet-sent reminders for one phone, soonest first.
+// Single-field query => no Firestore composite index needed.
+async function getUpcomingReminders(phone) {
+  const snapshot = await db.collection('reminders').where('phone', '==', phone).get();
+  const out = [];
+  snapshot.forEach(function(doc) {
+    const d = doc.data();
+    if (d.sent !== true) out.push({ id: doc.id, task: d.task, time: d.time.toDate() });
+  });
+  out.sort(function(a, b) { return a.time - b.time; });
+  return out;
+}
+
+async function deleteReminder(id) {
+  await db.collection('reminders').doc(id).delete();
+}
+
+function wantsReminderList(message) {
+  const lower = (message || '').toLowerCase();
+  return /\b(show|list|see|view|what(?:'?s| are)|whats)\b[^\n]*\breminders?\b/.test(lower)
+    || /^(my )?reminders\??$/.test(lower.trim());
+}
+
+function wantsCancelReminder(message) {
+  const lower = (message || '').toLowerCase();
+  return /\b(cancel|delete|remove|clear|scrap|drop)\b[^\n]*\breminders?\b/.test(lower)
+    || /\bforget (the |my )?reminder/.test(lower);
 }
 
 // Log anything Flow can't do yet so the team can see what people are asking for.
@@ -818,12 +852,13 @@ app.post('/sms', async function(req, res) {
 
         let flowReply = (visionResp.choices[0].message.content || '').trim();
 
-        const rm = flowReply.match(/REMINDER:\s*(.+?)\s*\|\s*(.+)/);
-        if (rm) {
+        const photoReminderRe = /REMINDER:\s*(.+?)\s*\|\s*(.+)/gi;
+        let rm;
+        while ((rm = photoReminderRe.exec(flowReply)) !== null) {
           const parsedTime = parseAuTime(rm[2].trim(), tzForState(user.state));
           if (parsedTime) await saveReminder({ phone: userPhone, name: user.name, task: rm[1].trim(), time: parsedTime });
-          flowReply = flowReply.replace(/\nREMINDER:.*$/m, '').trim();
         }
+        flowReply = flowReply.replace(/^\s*REMINDER:.*$/gim, '').replace(/\n{2,}/g, '\n').trim();
 
         if (!flowReply) flowReply = "Got the photo but couldn't make it out - try a clearer shot.";
 
@@ -844,19 +879,30 @@ app.post('/sms', async function(req, res) {
     // Timezone used for this user's reminder parsing and display.
     const userTz = tzForState(user.state);
 
-    if (user.pendingReminderTask && user.pendingReminderTask !== '') {
-      const task = user.pendingReminderTask;
-      user.pendingReminderTask = '';
-      await saveUser(userPhone, user);
+    if (Array.isArray(user.pendingReminders) && user.pendingReminders.length > 0) {
+      // let them bail out of the whole queue
+      if (/^(cancel|stop|nevermind|never mind|forget it)\.?$/i.test(userMessage.trim())) {
+        user.pendingReminders = [];
+        await saveUser(userPhone, user);
+        twiml.message("No worries - cleared that. What else can I do for you?");
+        return reply();
+      }
+
+      const task = user.pendingReminders[0];
       const parsedTime = parseAuTime(userMessage, userTz);
 
       if (parsedTime) {
         await saveReminder({ phone: userPhone, name: user.name, task: task, time: parsedTime });
-        twiml.message("Locked in. I'll remind you to " + task + " at " + parsedTime.toLocaleTimeString('en-AU', { hour: '2-digit', minute: '2-digit', timeZone: userTz }) + ".");
-      } else {
-        user.pendingReminderTask = task;
+        user.pendingReminders = user.pendingReminders.slice(1); // pop the one we just set
+        let msg = "Locked in. I'll remind you to " + task + " at " +
+          parsedTime.toLocaleTimeString('en-AU', { hour: '2-digit', minute: '2-digit', timeZone: userTz }) + ".";
+        if (user.pendingReminders.length > 0) {
+          msg += " And what time for \"" + user.pendingReminders[0] + "\"?";
+        }
         await saveUser(userPhone, user);
-        twiml.message("I didn't catch that time. What time exactly?");
+        twiml.message(msg);
+      } else {
+        twiml.message("I didn't catch that time. What time exactly for \"" + task + "\"?");
       }
 
       return reply();
@@ -1002,15 +1048,62 @@ app.post('/sms', async function(req, res) {
       return reply();
     }
 
+    // "Show my reminders"
+    if (wantsReminderList(userMessage)) {
+      const ups = await getUpcomingReminders(userPhone);
+      if (ups.length === 0) {
+        twiml.message("You've got no reminders set right now. Just tell me what to remember and when.");
+        return reply();
+      }
+      const lines = ups.slice(0, 8).map(function(r, i) {
+        return (i + 1) + ". " + r.task + " - " +
+          r.time.toLocaleString('en-AU', { weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit', timeZone: userTz });
+      });
+      let msg = "Your reminders:\n" + lines.join('\n');
+      if (ups.length > 8) msg += "\n(+" + (ups.length - 8) + " more)";
+      msg += "\nSay e.g. \"cancel the " + ups[0].task + "\" to clear one.";
+      twiml.message(msg);
+      return reply();
+    }
+
+    // "Cancel a reminder"
+    if (wantsCancelReminder(userMessage)) {
+      const ups = await getUpcomingReminders(userPhone);
+      if (ups.length === 0) { twiml.message("You've got no reminders to cancel."); return reply(); }
+
+      const lowerC = userMessage.toLowerCase();
+      if (/\b(all|everything)\b/.test(lowerC)) {
+        for (const r of ups) await deleteReminder(r.id);
+        twiml.message("Cleared all " + ups.length + " reminders.");
+        return reply();
+      }
+
+      // match the leftover words against the reminder text
+      const q = lowerC
+        .replace(/\b(cancel|delete|remove|clear|scrap|drop|the|my|reminder|reminders|to|forget|about|for)\b/g, ' ')
+        .replace(/\s+/g, ' ').trim();
+      const target = q ? ups.find(function(r) { return r.task.toLowerCase().includes(q); }) : null;
+
+      if (!target) {
+        const lines = ups.slice(0, 8).map(function(r) { return "- " + r.task; });
+        twiml.message("Which one? You've got:\n" + lines.join('\n') + "\nTell me a few words from the one to cancel.");
+        return reply();
+      }
+      await deleteReminder(target.id);
+      twiml.message("Done - cancelled the reminder to " + target.task + ".");
+      return reply();
+    }
+
     const reminderKeywords = ['remind me', 'reminder', "don't let me forget", 'make sure i'];
     const hasReminder = reminderKeywords.some(function(k) { return userMessage.toLowerCase().includes(k); });
 
     if (hasReminder && isVagueTime(userMessage)) {
       const taskMatch = userMessage.match(/remind(?:er)?\s+(?:me\s+)?(?:to\s+)?(.+?)(?:\s+in the morning|\s+after work|\s+at night|\s+tonight|\s+this evening|\s+at lunch|\s+lunchtime|\s+first thing|\s+later|\s+sometime)/i);
       const task = taskMatch ? taskMatch[1].trim() : userMessage;
-      user.pendingReminderTask = task;
+      if (!Array.isArray(user.pendingReminders)) user.pendingReminders = [];
+      user.pendingReminders.push(task);
       await saveUser(userPhone, user);
-      twiml.message("What time exactly?");
+      twiml.message("What time exactly for \"" + task + "\"?");
       return reply();
     }
 
@@ -1049,7 +1142,7 @@ app.post('/sms', async function(req, res) {
       ? "\nThis user has connected Xero. You CAN see their invoices and money owed - if they ask about cash, invoices, or who owes them, that is handled live elsewhere, so just answer naturally and never say you can't access their accounts."
       : "\nThis user has NOT connected Xero yet. If they ask about invoices or money owed, tell them you can pull it from Xero once it's connected and that they can text 'connect Xero' to set it up.";
 
-    const systemPrompt = "You are Flow, an AI assistant built specifically for Australian construction business owners.\n\nRULES:\n- Professional and direct - no fluff\n- Never say you cannot access the internet\n- Never offer further help at the end of a message\n- Never end with a question unless you genuinely need information\n- Never mention ChatGPT or OpenAI\n- Always refer to yourself as Flow\n- Maximum three sentences per reply\n- Australian spelling and dollars\n- Always use the user's work areas and state for location based questions\n- You know their regular suppliers and their biggest admin headache. Reference suppliers by name when ordering or prices come up, and look for natural chances to help with that admin pain.\n\nWhen search results are provided you MUST use them.\n\nFor reminders with a clear time confirm in one sentence then add: REMINDER: [task] | [time]\n\nIf the user asks for something you genuinely cannot do, respond warmly in one or two sentences, tell them it is not a current feature, then add on its OWN new line exactly:\nFEATURE_REQUEST: [what they asked for]\n\nAs you chat, quietly learn about the business. When you learn something genuinely new (not already listed below), add it on its OWN new line at the very end of your reply using these tags - do not repeat a tag for something already known:\nLEARN_TEAM: [name] | [role]\nLEARN_SUPPLIER: [name] | [category]\nLEARN_CLIENT: [name] | [notes]\nLEARN_NOTE: [fact]\nLEARN_LEAD: [job or client] | [detail]\nUse LEARN_LEAD when they mention a possible job, enquiry, or quote that hasn't been won yet (e.g. someone asked them to price a job). Also: when they tell you their name or what to call them, add on its own line LEARN_NAME: [name]. These tags are stripped before the user sees the message, so keep them off the lines the user reads.\n\nWhen the user mentions a person's name you don't recognise from the team list, after completing their request ask: 'Is [name] part of your team? I can keep track of them for you.'\n\nUser profile: " + user.businessContext + teamContext + knowledgeContext + integrationsContext + "\nName: " + user.name + "\nState: " + user.state + "\nWork areas: " + user.workAreas + "\nWork hours: " + user.workHours + "\nFinish time: " + user.finishTime + "\nRegular suppliers: " + user.suppliers + "\nBiggest admin headache: " + user.adminHeadache + "\nLocal time: " + new Date().toLocaleString('en-AU', { timeZone: userTz }) + searchContext;
+    const systemPrompt = "You are Flow, an AI assistant built specifically for Australian construction business owners.\n\nRULES:\n- Professional and direct - no fluff\n- Never say you cannot access the internet\n- Never offer further help at the end of a message\n- Never end with a question unless you genuinely need information\n- Never mention ChatGPT or OpenAI\n- Always refer to yourself as Flow\n- Maximum three sentences per reply\n- Australian spelling and dollars\n- Always use the user's work areas and state for location based questions\n- You know their regular suppliers and their biggest admin headache. Reference suppliers by name when ordering or prices come up, and look for natural chances to help with that admin pain.\n\nWhen search results are provided you MUST use them.\n\nFor each reminder with a clear time, confirm briefly then add it on its OWN new line: REMINDER: [task] | [time]. If they ask for several reminders in one message, output a separate REMINDER: line for every one.\n\nIf the user asks for something you genuinely cannot do, respond warmly in one or two sentences, tell them it is not a current feature, then add on its OWN new line exactly:\nFEATURE_REQUEST: [what they asked for]\n\nAs you chat, quietly learn about the business. When you learn something genuinely new (not already listed below), add it on its OWN new line at the very end of your reply using these tags - do not repeat a tag for something already known:\nLEARN_TEAM: [name] | [role]\nLEARN_SUPPLIER: [name] | [category]\nLEARN_CLIENT: [name] | [notes]\nLEARN_NOTE: [fact]\nLEARN_LEAD: [job or client] | [detail]\nUse LEARN_LEAD when they mention a possible job, enquiry, or quote that hasn't been won yet (e.g. someone asked them to price a job). Also: when they tell you their name or what to call them, add on its own line LEARN_NAME: [name]. These tags are stripped before the user sees the message, so keep them off the lines the user reads.\n\nWhen the user mentions a person's name you don't recognise from the team list, after completing their request ask: 'Is [name] part of your team? I can keep track of them for you.'\n\nUser profile: " + user.businessContext + teamContext + knowledgeContext + integrationsContext + "\nName: " + user.name + "\nState: " + user.state + "\nWork areas: " + user.workAreas + "\nWork hours: " + user.workHours + "\nFinish time: " + user.finishTime + "\nRegular suppliers: " + user.suppliers + "\nBiggest admin headache: " + user.adminHeadache + "\nLocal time: " + new Date().toLocaleString('en-AU', { timeZone: userTz }) + searchContext;
 
     const response = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
@@ -1059,9 +1152,12 @@ app.post('/sms', async function(req, res) {
 
     let flowReply = (response.choices[0].message.content || '').trim();
 
-    // --- REMINDER side-effect (the tag line is stripped in the pass below) ---
-    const reminderMatch = flowReply.match(/REMINDER:\s*(.+?)\s*\|\s*(.+)/);
-    if (reminderMatch) {
+    // --- REMINDER side-effects: save EVERY reminder Flow emitted (tag lines are
+    // stripped in the line pass below). Global regex => multiple reminders in one
+    // message all get created, not just the first. ---
+    const reminderRe = /REMINDER:\s*(.+?)\s*\|\s*(.+)/gi;
+    let reminderMatch;
+    while ((reminderMatch = reminderRe.exec(flowReply)) !== null) {
       const task = reminderMatch[1].trim();
       const timeText = reminderMatch[2].trim();
       const parsedTime = parseAuTime(timeText, userTz);
@@ -1230,7 +1326,7 @@ app.get('/callback/xero', async function(req, res) {
 
     res.set('Content-Type', 'text/html');
     res.send('<html><body style="font-family:system-ui;text-align:center;padding:48px">' +
-      '<h2>Xero connected ✔</h2><p>You can close this and head back to your texts with Flow.</p></body></html>');
+      '<h2>Xero connected \u2714</h2><p>You can close this and head back to your texts with Flow.</p></body></html>');
   } catch (err) {
     console.error('callback/xero error:', err);
     res.status(500).send('Could not finish connecting Xero. Please try the link again.');
