@@ -626,6 +626,317 @@ function wantsCrewList(message) {
     || /^(my )?(crew|team)\??$/.test(lower.trim());
 }
 
+// Is this inbound number one of someone's saved crew members (an employee)?
+async function isKnownCrewNumber(phone) {
+  try {
+    const snap = await db.collection('users').where('crewPhones', 'array-contains', phone).limit(1).get();
+    return !snap.empty;
+  } catch (e) { console.error('Crew lookup failed:', e); return false; }
+}
+
+// Find which boss a crew number belongs to (+ that crew member's record).
+async function findCrewMembership(phone) {
+  try {
+    const snap = await db.collection('users').where('crewPhones', 'array-contains', phone).limit(1).get();
+    if (snap.empty) return null;
+    const doc = snap.docs[0];
+    const boss = doc.data();
+    const member = (Array.isArray(boss.crew) ? boss.crew : []).find(function (c) { return c && c.phone === phone; });
+    return { bossPhone: doc.id, boss: boss, member: member || { name: '', phone: phone } };
+  } catch (e) { console.error('Crew membership lookup failed:', e); return null; }
+}
+
+// ----- Timesheets: crew text "on site"/"knocked off"/"7 to 3"; Flow builds the sheet -----
+function nowHHMM(tz) {
+  return new Date().toLocaleTimeString('en-AU', { hour: '2-digit', minute: '2-digit', hour12: false, timeZone: tz });
+}
+function fmtMin(mins) {
+  const h = Math.floor(mins / 60) % 24, m = mins % 60;
+  return (h < 10 ? '0' : '') + h + ':' + (m < 10 ? '0' : '') + m;
+}
+function parseClockTime(s) {
+  const m = (s || '').match(/(\d{1,2})(?::(\d{2}))?\s*(am|pm)?/i);
+  if (!m) return null;
+  let h = parseInt(m[1], 10);
+  const min = m[2] ? parseInt(m[2], 10) : 0;
+  const ap = m[3] ? m[3].toLowerCase() : null;
+  if (h > 23 || min > 59) return null;
+  if (ap === 'pm' && h < 12) h += 12;
+  if (ap === 'am' && h === 12) h = 0;
+  return h * 60 + min;
+}
+function parseTimeRange(message) {
+  const m = (message || '').match(/(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)\s*(?:to|till|til|until|thru|through|[-\u2013])\s*(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)/i);
+  if (!m) return null;
+  let start = parseClockTime(m[1]);
+  let finish = parseClockTime(m[2]);
+  if (start == null || finish == null) return null;
+  if (finish < start) finish += 12 * 60; // no am/pm given - assume the finish is pm
+  if (finish <= start) return null;
+  return { start: fmtMin(start), finish: fmtMin(finish), hours: Math.round(((finish - start) / 60) * 100) / 100 };
+}
+function parseTimesheet(message, tz) {
+  const lower = (message || '').toLowerCase();
+  const range = parseTimeRange(message);
+  if (range) return { type: 'range', start: range.start, finish: range.finish, hours: range.hours };
+  const isFinish = /\b(knock(?:ed|ing)? off|clock(?:ed|ing)? off|finished|finishing up|done for (?:the day|today)|off site|heading off|home time|leaving site|that'?s me)\b/.test(lower);
+  const isStart = /\b(on site|onsite|on the tools|clock(?:ed|ing)? on|starting|started|here now|at site|on the job)\b/.test(lower);
+  const now = nowHHMM(tz);
+  if (isFinish) return { type: 'finish', time: now };
+  if (isStart) return { type: 'start', time: now };
+  return null;
+}
+function hoursBetween(startHHMM, finishHHMM) {
+  function toMin(t) { const p = (t || '').split(':'); return parseInt(p[0], 10) * 60 + parseInt(p[1] || '0', 10); }
+  let mins = toMin(finishHHMM) - toMin(startHHMM);
+  if (mins < 0) mins += 24 * 60;
+  return Math.round((mins / 60) * 100) / 100;
+}
+async function recordTimesheet(membership, ts, tz) {
+  const boss = membership.boss;
+  const phone = membership.member.phone;
+  const name = membership.member.name || 'crew';
+  const todayKey = localDateKey(tz);
+  if (!Array.isArray(boss.timesheets)) boss.timesheets = [];
+  let complete = false;
+
+  if (ts.type === 'range') {
+    boss.timesheets.push({ phone: phone, name: name, date: todayKey, start: ts.start, finish: ts.finish, hours: ts.hours, at: new Date().toISOString() });
+    complete = true;
+  } else if (ts.type === 'start') {
+    boss.timesheets.push({ phone: phone, name: name, date: todayKey, start: ts.time, finish: null, hours: null, at: new Date().toISOString() });
+  } else if (ts.type === 'finish') {
+    const open = boss.timesheets.find(function (e) { return e && e.phone === phone && e.date === todayKey && e.start && !e.finish; });
+    if (open) { open.finish = ts.time; open.hours = hoursBetween(open.start, ts.time); complete = true; }
+    else boss.timesheets.push({ phone: phone, name: name, date: todayKey, start: null, finish: ts.time, hours: null, at: new Date().toISOString() });
+  }
+  if (boss.timesheets.length > 5000) boss.timesheets = boss.timesheets.slice(-5000);
+  await db.collection('users').doc(membership.bossPhone).update({ timesheets: boss.timesheets });
+  return complete;
+}
+
+function hhmmToMin(t) { const p = (t || '').split(':'); return parseInt(p[0], 10) * 60 + parseInt(p[1] || '0', 10); }
+
+function parseBareTime(message) {
+  const t = (message || '').trim();
+  if (!/^\d{1,2}(:\d{2})?\s*(am|pm)?\.?$/i.test(t)) return null;
+  const mins = parseClockTime(t);
+  return mins == null ? null : fmtMin(mins);
+}
+
+function looksLikeTimeAttempt(message) {
+  const lower = (message || '').toLowerCase();
+  const words = /\b(hours?|hrs?|shift|start(?:ed|ing)?|finish(?:ed|ing)?|clock(?:ed)?|knock(?:ed)?|on site|off site|worked?|on the tools)\b/.test(lower);
+  const timeNumber = /\b\d{1,2}(?::\d{2})?\s*(?:am|pm)\b/.test(lower) || /\b\d{1,2}\s*(?:to|till|til|until|[-\u2013])\s*\d{1,2}\b/.test(lower);
+  return words || timeNumber;
+}
+
+// Fill a bare clarification time (e.g. "7") into today's incomplete entry.
+async function fillIncompleteTimesheet(membership, bareHHMM, tz) {
+  const boss = membership.boss;
+  const phone = membership.member.phone;
+  const todayKey = localDateKey(tz);
+  if (!Array.isArray(boss.timesheets)) return false;
+  const entry = boss.timesheets.find(function (e) { return e && e.phone === phone && e.date === todayKey && (!e.start || !e.finish); });
+  if (!entry) return false;
+  if (!entry.start) {
+    entry.start = bareHHMM;
+  } else if (!entry.finish) {
+    let fm = hhmmToMin(bareHHMM);
+    if (fm < hhmmToMin(entry.start)) fm += 12 * 60; // assume a pm finish
+    entry.finish = fmtMin(fm % (24 * 60));
+  }
+  if (entry.start && entry.finish) entry.hours = hoursBetween(entry.start, entry.finish);
+  await db.collection('users').doc(membership.bossPhone).update({ timesheets: boss.timesheets });
+  return true;
+}
+
+// Handle a crew member's inbound: log/clarify their times, or stay silent.
+async function processCrewTimesheet(membership, message, tz) {
+  const name = membership.member.name || 'mate';
+  const ts = parseTimesheet(message, tz);
+
+  if (ts && ts.type === 'range') {
+    await recordTimesheet(membership, ts, tz);
+    return "Thanks " + name + ".";
+  }
+  if (ts && ts.type === 'start') {
+    await recordTimesheet(membership, ts, tz);
+    return "Thanks " + name + " - I'll log your knock-off when you text it.";
+  }
+  if (ts && ts.type === 'finish') {
+    const closed = await recordTimesheet(membership, ts, tz);
+    if (closed) return "Thanks " + name + ".";
+    return "Thanks " + name + " - what time did you get on site today? I'll sort your hours.";
+  }
+
+  const bare = parseBareTime(message);
+  if (bare) {
+    const filled = await fillIncompleteTimesheet(membership, bare, tz);
+    if (filled) return "Thanks " + name + ".";
+    await recordTimesheet(membership, { type: 'start', time: bare }, tz);
+    return "Thanks " + name + " - I'll log your knock-off when you text it.";
+  }
+
+  if (looksLikeTimeAttempt(message)) {
+    return "Sorry " + name + ", didn't quite catch that - what time did you start and knock off today?";
+  }
+
+  return null; // not about their times -> stay silent
+}
+
+// An employee asking to get SiteFlow for THEIR OWN business (a separate account).
+function wantsOwnAccount(message) {
+  const lower = (message || '').toLowerCase();
+  const ownership = /\b(my own|for myself|for my own|of my own|own account|own siteflow|own flow)\b/.test(lower);
+  const signup = /\b(sign me up|sign up|signup|set me up|get siteflow|get my own|i want siteflow|want my own|how do i get|can i get|join|subscribe|become a customer)\b/.test(lower);
+  return ownership || signup;
+}
+
+// ----- Dual role: a number that runs its own SiteFlow AND clocks in for an employer -----
+// A clock-in for the employer must be explicitly marked at the START of the message,
+// so it's never confused with a normal message to the person's own assistant.
+// Accepts: "clock on/off/in/out [time]", "clock 7 to 3", "work: 7 to 3", "timesheet: ...".
+function parseClockInForBoss(message) {
+  const raw = (message || '').trim();
+  let m = raw.match(/^(?:work|timesheet|clock)\s*[:\-]\s*(.+)$/i);
+  if (m) return { marker: true, rest: m[1].trim() };
+  m = raw.match(/^clock(?:ed|ing)?\s+(on|off|in|out)\b(.*)$/i);
+  if (m) {
+    const d = m[1].toLowerCase();
+    return { marker: true, dir: (d === 'off' || d === 'out') ? 'finish' : 'start', rest: (m[2] || '').trim() };
+  }
+  m = raw.match(/^clock(?:ed|ing)?\s+(.+)$/i);
+  if (m && /\d/.test(m[1])) return { marker: true, rest: m[1].trim() };
+  return null;
+}
+
+function extractTime(s) {
+  const m = (s || '').match(/\b(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)\b/i);
+  if (!m) return null;
+  const mm = parseClockTime(m[1]);
+  return mm == null ? null : fmtMin(mm);
+}
+
+// If a bare finish time (no am/pm) lands before today's open start, assume it's pm.
+function pmAdjustFinish(membership, finishHHMM, tz) {
+  const todayKey = localDateKey(tz);
+  const sheets = Array.isArray(membership.boss.timesheets) ? membership.boss.timesheets : [];
+  const open = sheets.find(function (e) { return e && e.phone === membership.member.phone && e.date === todayKey && e.start && !e.finish; });
+  if (open && hhmmToMin(finishHHMM) < hhmmToMin(open.start)) return fmtMin((hhmmToMin(finishHHMM) + 12 * 60) % (24 * 60));
+  return finishHHMM;
+}
+
+// Apply an explicitly-marked clock-in to the employer's timesheet. Reveals nothing
+// about the employer - the reply only ever uses the person's own name.
+async function applyClockIn(membership, marker, tz) {
+  const name = membership.member.name || 'mate';
+  const rest = (marker.rest || '').trim();
+
+  const range = parseTimeRange(rest);
+  if (range) {
+    await recordTimesheet(membership, { type: 'range', start: range.start, finish: range.finish, hours: range.hours }, tz);
+    return "Thanks " + name + " - logged to your work timesheet.";
+  }
+
+  let dir = marker.dir || null;
+  if (!dir && /\b(off|out|finished?|knock)/i.test(rest)) dir = 'finish';
+  if (!dir && /\b(on|in|start(?:ed)?)\b/i.test(rest)) dir = 'start';
+
+  const time = extractTime(rest);
+
+  if (dir === 'finish') {
+    const t = time ? pmAdjustFinish(membership, time, tz) : nowHHMM(tz);
+    const complete = await recordTimesheet(membership, { type: 'finish', time: t }, tz);
+    return complete ? ("Thanks " + name + " - clocked off at work.")
+                    : ("Thanks " + name + " - what time did you start? (e.g. \"clock on 7\")");
+  }
+  if (dir === 'start') {
+    await recordTimesheet(membership, { type: 'start', time: time || nowHHMM(tz) }, tz);
+    return "Thanks " + name + " - clocked on at work. I'll log your knock-off when you clock off.";
+  }
+  if (time) { // bare time, no direction -> fill today's open entry, else start it
+    const filled = await fillIncompleteTimesheet(membership, time, tz);
+    if (filled) return "Thanks " + name + " - logged to your work timesheet.";
+    await recordTimesheet(membership, { type: 'start', time: time }, tz);
+    return "Thanks " + name + " - clocked on at work. I'll log your knock-off when you clock off.";
+  }
+
+  return "Righto - what time? Try \"clock 7 to 3\", \"clock on\", or \"clock off\".";
+}
+
+// Start of the rolling 7-day window ending today (covers the pay week up to pay day).
+function last7DaysStartKey(tz) {
+  const now = new Date();
+  return localDateKey(tz, new Date(now.getTime() - 6 * 24 * 60 * 60 * 1000));
+}
+
+const DAY_MAP = {
+  mon: 'Mon', monday: 'Mon', tue: 'Tue', tues: 'Tue', tuesday: 'Tue',
+  wed: 'Wed', weds: 'Wed', wednesday: 'Wed', thu: 'Thu', thur: 'Thu', thurs: 'Thu', thursday: 'Thu',
+  fri: 'Fri', friday: 'Fri', sat: 'Sat', saturday: 'Sat', sun: 'Sun', sunday: 'Sun'
+};
+const DAY_LONG = { Mon: 'Monday', Tue: 'Tuesday', Wed: 'Wednesday', Thu: 'Thursday', Fri: 'Friday', Sat: 'Saturday', Sun: 'Sunday' };
+
+// "I do pays on Thursday" / "send the timesheets on Monday" -> sets the weekly send day.
+// Ignores view requests like "show me Monday's timesheets".
+function parseTimesheetDay(message) {
+  const lower = (message || '').toLowerCase();
+  const dm = lower.match(/\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tues|tue|weds|wed|thurs|thur|thu|fri|sat|sun)\b/);
+  if (!dm) return null;
+  const day = DAY_MAP[dm[1]];
+  if (!day) return null;
+  const payCue = /\b(pay|pays|payday|pay day|payroll)\b/.test(lower);
+  const scheduleCue = /\b(send|do|give|message|text)\b/.test(lower)
+    && /\b(time ?sheets?|times|hours|weekly|roundup|summary)\b/.test(lower);
+  const viewCue = /\b(show|what|whats|how many|view|see|pull up)\b/.test(lower);
+  if (viewCue && !payCue) return null;
+  if (payCue || scheduleCue) return day;
+  return null;
+}
+function wantsTimesheetSummary(message) {
+  const lower = (message || '').toLowerCase();
+  return /\btime ?sheets?\b/.test(lower)
+    || /\bpayroll\b/.test(lower)
+    || (/\b(hours|times)\b/.test(lower) && /\b(crew|team|this week|week|today|everyone|payroll)\b/.test(lower));
+}
+
+// Build the compiled weekly timesheet: one short line per crew member with each
+// day's hours and a total, plus a grand total. Covers the 7 days up to today.
+// Returns null if nothing logged.
+function weeklyTimesheetMessage(sheets, tz) {
+  if (!Array.isArray(sheets) || !sheets.length) return null;
+  const startKey = last7DaysStartKey(tz);
+  const todayKey = localDateKey(tz);
+  const wk = sheets.filter(function (e) { return e && e.date && e.date >= startKey && e.date <= todayKey; });
+  if (!wk.length) return null;
+  const dayAbbr = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+  const byName = {};
+  wk.forEach(function (e) {
+    const n = e.name || 'crew';
+    if (!byName[n]) byName[n] = { days: {}, open: 0 };
+    if (typeof e.hours === 'number') byName[n].days[e.date] = (byName[n].days[e.date] || 0) + e.hours;
+    else byName[n].open += 1;
+  });
+  let grand = 0;
+  const lines = Object.keys(byName).map(function (n) {
+    const r = byName[n];
+    const dates = Object.keys(r.days).sort();
+    let total = 0;
+    const parts = dates.map(function (dk) {
+      total += r.days[dk];
+      const d = new Date(dk + 'T00:00:00Z').getUTCDay();
+      return dayAbbr[d] + ' ' + round1(r.days[dk]);
+    });
+    grand += total;
+    let s = n + " " + round1(total) + "h: " + (parts.length ? parts.join(', ') : '-');
+    if (r.open) s += " (" + r.open + " open)";
+    return s;
+  });
+  return "Timesheets - week ending " + fmtDateKey(todayKey) + ":\n" + lines.join('\n')
+    + "\nTotal " + round1(grand) + "h across " + Object.keys(byName).length + ".";
+}
+
 // Log anything Flow can't do yet so the team can see what people are asking for.
 async function logFeatureRequest(phone, trade, request) {
   await db.collection('feature_requests').add({
@@ -1314,6 +1625,36 @@ setInterval(async function() {
   } catch (err) { console.error('Compliance scheduler error:', err); }
 }, 60 * 60 * 1000);
 
+// 7) Weekly timesheet roundup to the boss - hourly check, fires Fri ~5pm local,
+// once a week. Compiles the week's hours per crew member into one short message.
+setInterval(async function() {
+  try {
+    const snapshot = await db.collection('users')
+      .where('onboarded', '==', true)
+      .get();
+
+    for (const doc of snapshot.docs) {
+      const user = doc.data();
+      const phone = doc.id;
+      if (!Array.isArray(user.timesheets) || !user.timesheets.length) continue;
+
+      const tz = tzForState(user.state);
+      const wh = localWeekdayHour(tz);
+      const sendDay = user.payDay || 'Fri'; // matches the boss's payroll day
+      if (wh.weekday !== sendDay || wh.hour !== 17) continue; // chosen day, 5pm local
+      if (user.lastTimesheetSummaryAt && (Date.now() - new Date(user.lastTimesheetSummaryAt).getTime()) < 5 * 24 * 60 * 60 * 1000) continue;
+
+      const msg = weeklyTimesheetMessage(user.timesheets, tz);
+      if (!msg) continue;
+      try {
+        await twilioClient.messages.create({ body: "Here's the week's timesheets:\n\n" + msg, from: process.env.TWILIO_PHONE_NUMBER, to: phone });
+        await db.collection('users').doc(phone).update({ lastTimesheetSummaryAt: new Date().toISOString() });
+        console.log("Weekly timesheet sent to: " + phone);
+      } catch (err) { console.error('Weekly timesheet send failed:', err); }
+    }
+  } catch (err) { console.error('Timesheet summary scheduler error:', err); }
+}, 60 * 60 * 1000);
+
 // ============================ SMS WEBHOOK ============================
 
 app.post('/sms', async function(req, res) {
@@ -1372,6 +1713,49 @@ app.post('/sms', async function(req, res) {
     // Record activity on every inbound message (feeds the proactive scheduler).
     user.lastMessageAt = new Date().toISOString();
 
+    // ===== PRIVACY BOUNDARY: crew members (employees) =====
+    // Flow stays SILENT with employees and NEVER reveals anything about the boss's
+    // business. Enforced structurally: a crew member's phone only ever loads its own
+    // account, and this branch returns before the AI or any business handler runs.
+    // The only replies an employee gets are a thanks for their times or a question
+    // about their times; their clock-ins are logged to the boss's account.
+    // An employee may ALSO sign up for their own SiteFlow on this same number - their
+    // clock-ins keep working right through signup, and afterwards they use a "clock"
+    // prefix to send times to the boss (dual-role handling in the onboarded section).
+    if (!user.onboarded) {
+      const membership = await findCrewMembership(userPhone);
+      if (membership) {
+        const bossTz = tzForState(membership.boss.state);
+
+        // They want their own SiteFlow on this number -> explain dual-role clearly.
+        if (wantsOwnAccount(userMessage) && user.signupStarted !== true) {
+          user.signupStarted = true;
+          await saveUser(userPhone, user);
+          twiml.message(
+            "Good on you - here's how it works so nothing gets crossed:\n\n" +
+            "1) Your SiteFlow is a separate, private account on this number. Your boss won't see any of it, and I'll never share their business with you.\n\n" +
+            "2) IMPORTANT: this is the same number you clock in on. Once you're set up, your normal texts come to YOUR SiteFlow - so to keep your boss getting your hours, start those texts with \"clock\": e.g. \"clock on\", \"clock off\", \"clock 7 to 3\". Anything without \"clock\" goes to your own account.\n\n" +
+            "3) Want them fully separate instead? Sign up on a different number, and this one keeps clocking in as normal - no \"clock\" needed.\n\n" +
+            "To set up on THIS number: grab a plan at siteflowassistant.com and text me the access code. Until you finish, you keep clocking in as normal."
+          );
+          return reply();
+        }
+
+        // Always log their times to the boss - works even mid-signup, so clocking in
+        // never breaks. processCrewTimesheet returns null only for non-time messages.
+        let crewReply = null;
+        try { crewReply = await processCrewTimesheet(membership, userMessage, bossTz); }
+        catch (e) { console.error('Timesheet handling failed:', e); }
+        if (crewReply) { twiml.message(crewReply); return reply(); }
+
+        // Not about their times:
+        if (user.signupStarted !== true) {
+          return reply(); // pure crew, off-topic -> stay silent (no AI, no business data)
+        }
+        // Signup in progress -> let their access code flow into onboarding below.
+      }
+    }
+
     if (user.step === 'waitingCode' || user.step === 'welcome') {
       const entered = userMessage.trim();
       const codeDoc = await db.collection('access_codes').doc(entered).get();
@@ -1408,11 +1792,42 @@ app.post('/sms', async function(req, res) {
       user.signupAt = new Date().toISOString(); // starts the first-week getting-to-know-you clock
       await saveUser(userPhone, user);
       const hi = user.name ? ("Thanks " + user.name + " - ") : "Thanks - ";
-      twiml.message(hi + "that's everything sorted. I've got your back from here. Whenever something needs doing, just tell me and I'll keep you on track.");
+      let doneMsg = hi + "that's everything sorted. I've got your back from here. Whenever something needs doing, just tell me and I'll keep you on track.";
+      // Same-number dual-role: if they still clock in for a boss, remind them how.
+      try {
+        const stillCrew = await findCrewMembership(userPhone);
+        if (stillCrew) {
+          doneMsg += "\n\nReminder: you're on the same number you clock in on, so your texts now come to YOUR SiteFlow. To keep your boss getting your hours, start those texts with \"clock\" - like \"clock on\", \"clock off\" or \"clock 7 to 3\".";
+        }
+      } catch (e) { console.error('Dual-role finalize check failed:', e); }
+      twiml.message(doneMsg);
       return reply();
     }
 
     // ===================== ONBOARDED USER =====================
+
+    // Dual role: this number runs its own SiteFlow AND clocks in for an employer.
+    // A clock-in for the employer must be explicitly marked ("clock on", "clock off",
+    // "clock 7 to 3", "work: 7 to 3") so it's never mistaken for a message to their
+    // own assistant. Only marked messages touch the employer's timesheet - and only
+    // the timesheet, never any other data, in either direction.
+    {
+      const clockMarker = parseClockInForBoss(userMessage);
+      if (clockMarker) {
+        const membership = await findCrewMembership(userPhone);
+        if (membership) {
+          const bossTz = tzForState(membership.boss.state);
+          let crewReply = null;
+          try { crewReply = await applyClockIn(membership, clockMarker, bossTz); }
+          catch (e) { console.error('Dual-role clock-in failed:', e); }
+          twiml.message(crewReply || "Righto - what time? Try \"clock 7 to 3\".");
+          return reply();
+        } else {
+          twiml.message("You're not on anyone's crew to clock into yet - whoever you work for needs to add this number to their crew first. Your own SiteFlow isn't affected.");
+          return reply();
+        }
+      }
+    }
 
     // Incoming photo (MMS)? Read it with vision and short-circuit here.
     const numMedia = parseInt(req.body.NumMedia || '0', 10);
@@ -1660,6 +2075,7 @@ app.post('/sms', async function(req, res) {
       const existing = user.crew.find(function (c) { return c && c.phone === crewAdd.phone; });
       if (existing) existing.name = crewAdd.name;
       else user.crew.push({ name: crewAdd.name, phone: crewAdd.phone });
+      user.crewPhones = user.crew.map(function (c) { return c.phone; }).filter(Boolean);
       await saveUser(userPhone, user);
       twiml.message("Added " + crewAdd.name + " to your crew (" + crewAdd.phone + "). Now you can say \"tell the crew ...\" and I'll message everyone at once. That's " + user.crew.length + " on the crew.");
       return reply();
@@ -1676,6 +2092,7 @@ app.post('/sms', async function(req, res) {
       const removed = crew[idx].name;
       crew.splice(idx, 1);
       user.crew = crew;
+      user.crewPhones = crew.map(function (c) { return c.phone; }).filter(Boolean);
       await saveUser(userPhone, user);
       twiml.message("Took " + removed + " off the crew. " + crew.length + " left.");
       return reply();
@@ -1709,6 +2126,29 @@ app.post('/sms', async function(req, res) {
       }
       const lines = crew.slice(0, 20).map(function (c) { return "- " + c.name + " (" + c.phone + ")"; });
       twiml.message("Your crew (" + crew.length + "):\n" + lines.join('\n') + "\nSay \"tell the crew ...\" to message them all.");
+      return reply();
+    }
+
+    // "I do pays on Thursday" - set which day Flow sends the weekly roundup.
+    {
+      const payDay = parseTimesheetDay(userMessage);
+      if (payDay) {
+        user.payDay = payDay;
+        await saveUser(userPhone, user);
+        twiml.message("Done - I'll send you the week's timesheets every " + (DAY_LONG[payDay] || payDay) + " at 5pm, with everyone's hours up to then in the one message.");
+        return reply();
+      }
+    }
+
+    // "Timesheets" / "hours this week" - boss-facing payroll summary.
+    if (wantsTimesheetSummary(userMessage)) {
+      const sheets = Array.isArray(user.timesheets) ? user.timesheets : [];
+      const msg = weeklyTimesheetMessage(sheets, userTz);
+      if (!msg) {
+        twiml.message("Nothing logged this week yet. Your crew text me \"on site\" / \"knocked off\" or their hours like \"7 to 3\", and I build the sheet for you.");
+        return reply();
+      }
+      twiml.message(msg);
       return reply();
     }
 
