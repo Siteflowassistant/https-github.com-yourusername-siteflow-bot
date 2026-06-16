@@ -571,6 +571,61 @@ function wantsComplianceList(message) {
     || /^(my )?(tickets|compliance)\??$/.test(lower.trim());
 }
 
+// ----- Crew messaging: add crew with numbers, broadcast one message to all -----
+function normalizeAuMobile(raw) {
+  if (!raw) return null;
+  let d = ('' + raw).replace(/[^\d+]/g, '');
+  if (d.indexOf('+61') === 0) d = d.slice(3);
+  else if (d.indexOf('61') === 0 && d.length >= 11) d = d.slice(2);
+  else if (d.indexOf('0') === 0) d = d.slice(1);
+  if (/^4\d{8}$/.test(d)) return '+61' + d; // AU mobiles only
+  return null;
+}
+
+function findAuMobile(message) {
+  const m = (message || '').match(/(?:\+?61[\s-]?|0)?4(?:[\s-]?\d){8}\b/);
+  return m ? m[0] : null;
+}
+
+function parseCrewAdd(message) {
+  const lower = (message || '').toLowerCase();
+  const raw = findAuMobile(message);
+  if (!raw) return null;
+  const phone = normalizeAuMobile(raw);
+  if (!phone) return null;
+  const isCrew = /\b(crew|team|offsider|labou?rer|apprentice|chippy|chippie|sparky|subbie)\b/.test(lower)
+    && /\b(add|new|put|onboard|join|on the|to the|here'?s|this is|number|mobile|is)\b/.test(lower);
+  if (!isCrew) return null;
+  let name = (message || '')
+    .replace(raw, ' ')
+    .replace(/\b(add|new|put|onboard|join|to the|on the|crew member|crew|team|member|his|her|their|number'?s?|mobile|is|the|a|an|please|hey|flow)\b/gi, ' ')
+    .replace(/[^a-zA-Z '\-]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (name) name = name.split(' ').slice(0, 2).join(' ');
+  if (!name) name = 'crew member';
+  return { name: name, phone: phone };
+}
+
+function parseCrewRemove(message) {
+  const m = (message || '').match(/\b(?:remove|take off|delete|drop|get rid of|sack|kick)\s+(?:the\s+)?(.+?)\s+(?:from|off)\s+(?:the\s+|my\s+)?(?:crew|team)\b/i);
+  if (m && m[1]) return m[1].trim();
+  return null;
+}
+
+function parseCrewBroadcast(message) {
+  const m = (message || '').match(/^\s*(?:hey\s+)?(?:flow[,\s]+)?(?:can you\s+)?(?:please\s+)?(?:tell|let|message|msg|text|send|blast|notify|ping)\s+(?:the\s+)?(?:crew|team|everyone|all|boys|lads|guys|fellas)\b\s*(?:know\s+|that\s+|:\s*|to\s+)?(.*)$/i);
+  if (!m) return null;
+  const content = (m[1] || '').trim();
+  return content || null;
+}
+
+function wantsCrewList(message) {
+  const lower = (message || '').toLowerCase();
+  return /\b(show|list|who'?s|who is|view)\b[^\n]*\b(crew|team)\b/.test(lower)
+    || /^(my )?(crew|team)\??$/.test(lower.trim());
+}
+
 // Log anything Flow can't do yet so the team can see what people are asking for.
 async function logFeatureRequest(phone, trade, request) {
   await db.collection('feature_requests').add({
@@ -1595,6 +1650,65 @@ app.post('/sms', async function(req, res) {
         console.error('Hiring helper failed:', err);
         twiml.message("Couldn't draft that just now - try me again in a moment.");
       }
+      return reply();
+    }
+
+    // Crew messaging: add crew (with number), remove, broadcast to all, or list.
+    const crewAdd = parseCrewAdd(userMessage);
+    if (crewAdd) {
+      if (!Array.isArray(user.crew)) user.crew = [];
+      const existing = user.crew.find(function (c) { return c && c.phone === crewAdd.phone; });
+      if (existing) existing.name = crewAdd.name;
+      else user.crew.push({ name: crewAdd.name, phone: crewAdd.phone });
+      await saveUser(userPhone, user);
+      twiml.message("Added " + crewAdd.name + " to your crew (" + crewAdd.phone + "). Now you can say \"tell the crew ...\" and I'll message everyone at once. That's " + user.crew.length + " on the crew.");
+      return reply();
+    }
+
+    const crewRemoveName = parseCrewRemove(userMessage);
+    if (crewRemoveName) {
+      const crew = Array.isArray(user.crew) ? user.crew : [];
+      const idx = crew.findIndex(function (c) { return c && c.name && c.name.toLowerCase().indexOf(crewRemoveName.toLowerCase()) !== -1; });
+      if (idx === -1) {
+        twiml.message("Couldn't find \"" + crewRemoveName + "\" on your crew. Say \"show my crew\" to see who's on it.");
+        return reply();
+      }
+      const removed = crew[idx].name;
+      crew.splice(idx, 1);
+      user.crew = crew;
+      await saveUser(userPhone, user);
+      twiml.message("Took " + removed + " off the crew. " + crew.length + " left.");
+      return reply();
+    }
+
+    const broadcastContent = parseCrewBroadcast(userMessage);
+    if (broadcastContent) {
+      const crew = Array.isArray(user.crew) ? user.crew : [];
+      if (!crew.length) {
+        twiml.message("You haven't added any crew yet. Add them like \"add Jacko to the crew 0412 345 678\", then I can message everyone at once.");
+        return reply();
+      }
+      const fromName = user.name ? (user.name + ": ") : "";
+      let sent = 0;
+      for (const member of crew) {
+        if (!member || !member.phone) continue;
+        try {
+          await twilioClient.messages.create({ body: fromName + broadcastContent, from: process.env.TWILIO_PHONE_NUMBER, to: member.phone });
+          sent++;
+        } catch (err) { console.error('Crew broadcast failed to ' + member.phone + ':', err); }
+      }
+      twiml.message("Sent to " + sent + " of " + crew.length + " crew:\n\"" + broadcastContent + "\"");
+      return reply();
+    }
+
+    if (wantsCrewList(userMessage)) {
+      const crew = Array.isArray(user.crew) ? user.crew : [];
+      if (!crew.length) {
+        twiml.message("No crew added yet. Add someone like \"add Jacko to the crew 0412 345 678\".");
+        return reply();
+      }
+      const lines = crew.slice(0, 20).map(function (c) { return "- " + c.name + " (" + c.phone + ")"; });
+      twiml.message("Your crew (" + crew.length + "):\n" + lines.join('\n') + "\nSay \"tell the crew ...\" to message them all.");
       return reply();
     }
 
