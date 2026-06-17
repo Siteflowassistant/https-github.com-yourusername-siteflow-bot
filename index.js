@@ -394,6 +394,22 @@ async function markReminderSent(id) {
   await db.collection('reminders').doc(id).update({ sent: true });
 }
 
+// Atomically claim a reminder for sending. Returns true only for the ONE caller
+// that flips it from unsent->sent; everyone else (an overlapping tick, a second
+// instance, a retry) gets false. This guarantees a reminder fires at most once.
+async function claimReminder(id) {
+  try {
+    return await db.runTransaction(async function (tx) {
+      const ref = db.collection('reminders').doc(id);
+      const snap = await tx.get(ref);
+      if (!snap.exists) return false;
+      if (snap.data().sent === true) return false;
+      tx.update(ref, { sent: true });
+      return true;
+    });
+  } catch (e) { console.error('Reminder claim failed:', e); return false; }
+}
+
 // All not-yet-sent reminders for one phone, soonest first.
 // Single-field query => no Firestore composite index needed.
 async function getUpcomingReminders(phone) {
@@ -1654,24 +1670,27 @@ async function buildBriefing(user, phone, tz) {
 // spins down when idle they will NOT run reliably - use an always-on instance
 // or an external scheduler (e.g. Render Cron Jobs) hitting an endpoint.
 
-// 1) Reminder poller - fires due reminders every minute.
+// 1) Reminder poller - fires due reminders every minute. Claims each reminder
+// atomically BEFORE sending, so a slow send, an overlapping tick, a restart, or a
+// second instance can never fire the same reminder twice.
 setInterval(async function() {
   try {
     const now = new Date();
     const reminders = await getPendingReminders();
     for (let i = 0; i < reminders.length; i++) {
       const reminder = reminders[i];
-      if (now >= reminder.time) {
-        try {
-          await twilioClient.messages.create({
-            body: "Hey " + reminder.name + " - don't forget: " + reminder.task,
-            from: process.env.TWILIO_PHONE_NUMBER,
-            to: reminder.phone
-          });
-          await markReminderSent(reminder.id);
-          console.log("Reminder sent: " + reminder.task);
-        } catch (err) { console.error('Reminder failed:', err); }
-      }
+      if (now < reminder.time) continue;
+      const claimed = await claimReminder(reminder.id);
+      if (!claimed) continue; // already handled elsewhere - don't double-send
+      const greeting = reminder.name ? ("Hey " + reminder.name + " - ") : "";
+      try {
+        await twilioClient.messages.create({
+          body: greeting + "don't forget: " + reminder.task,
+          from: process.env.TWILIO_PHONE_NUMBER,
+          to: reminder.phone
+        });
+        console.log("Reminder sent: " + reminder.task);
+      } catch (err) { console.error('Reminder send failed:', err); }
     }
   } catch (err) { console.error('Reminder check failed:', err); }
 }, 60000);
@@ -2994,14 +3013,20 @@ app.post('/sms', async function(req, res) {
     // message all get created, not just the first. ---
     const reminderRe = /REMINDER:\s*(.+?)\s*\|\s*(.+)/gi;
     let reminderMatch;
+    const seenReminders = {};
+    let remindersMade = 0;
     while ((reminderMatch = reminderRe.exec(flowReply)) !== null) {
       const task = reminderMatch[1].trim();
       const timeText = reminderMatch[2].trim();
       const parsedTime = parseAuTime(timeText, userTz);
-      if (parsedTime) {
-        await saveReminder({ phone: userPhone, name: user.name, task: task, time: parsedTime });
-        console.log("Reminder saved: " + task + " for " + parsedTime);
-      }
+      if (!parsedTime) continue;
+      const key = task.toLowerCase() + '|' + parsedTime.getTime();
+      if (seenReminders[key]) continue;      // ignore duplicate lines in one reply
+      seenReminders[key] = true;
+      if (remindersMade >= 5) break;          // sanity cap per message
+      await saveReminder({ phone: userPhone, name: user.name, task: task, time: parsedTime });
+      remindersMade++;
+      console.log("Reminder saved: " + task + " for " + parsedTime);
     }
 
     // --- FEATURE_REQUEST side-effect ---
