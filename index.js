@@ -756,6 +756,62 @@ function extractPersonName(message) {
   return words.slice(0, 2).map(function (w) { return w ? (w.charAt(0).toUpperCase() + w.slice(1)) : w; }).join(' ');
 }
 
+// ----- Memory: never lose a fact the boss tells Flow about the business -----
+
+// Explicit "remember that ..." / "note ..." / "don't forget ...". Returns the fact.
+// "remember TO <do something>" is a task/reminder, not a fact - left for that flow.
+function parseRememberFact(message) {
+  const m = (message || '').match(/^\s*(?:hey\s+)?(?:flow[,\s]+)?(?:please\s+)?(?:remember|note|don'?t forget|keep in mind|make a note(?:\s+of)?|jot down|fyi|for the record)\b[:,]?\s*(?:that\s+)?(.+)$/i);
+  if (!m) return null;
+  let fact = (m[1] || '').trim();
+  if (/^to\s+\w/i.test(fact)) return null; // "remember to call X" = reminder, not a fact
+  fact = fact.replace(/\s+/g, ' ').replace(/[.!]+$/, '').trim();
+  if (fact.length < 2) return null;
+  return fact;
+}
+
+function wantsBusinessRecall(message) {
+  const lower = (message || '').toLowerCase();
+  return /\b(what do you (?:know|remember)|what have you (?:got|remembered|learned|noted)|what do you know about (?:me|my business|us)|everything you know|what'?s on file)\b/.test(lower);
+}
+
+// Friendly summary of everything Flow has stored - so the boss can SEE it's remembered.
+function buildRecallSummary(user) {
+  const k = user.knowledge || {};
+  const lines = [];
+  if (user.name || user.trade) lines.push("You: " + [user.name, user.trade, user.state].filter(Boolean).join(', '));
+  if (Array.isArray(user.crew) && user.crew.length) lines.push("Crew: " + user.crew.map(function (c) { return c.name; }).join(', '));
+  if (Array.isArray(user.clients) && user.clients.length) lines.push("Clients: " + user.clients.map(function (c) { return c.name + (c.job ? (" (" + c.job + ")") : ""); }).join(', '));
+  if (Array.isArray(k.suppliers) && k.suppliers.length) lines.push("Suppliers: " + k.suppliers.map(function (s) { return s.name + (s.category ? (" (" + s.category + ")") : ""); }).join(', '));
+  if (Array.isArray(k.team) && k.team.length) lines.push("People: " + k.team.map(function (t) { return t.name + (t.role ? (" (" + t.role + ")") : ""); }).join(', '));
+  if (Array.isArray(user.compliance) && user.compliance.length) lines.push("Tickets: " + user.compliance.map(function (c) { return c.label + " (exp " + c.expiry + ")"; }).join(', '));
+  if (Array.isArray(k.leads) && k.leads.length) lines.push("Open leads: " + k.leads.map(function (l) { return l.label; }).join(', '));
+  if (Array.isArray(k.notes) && k.notes.length) lines.push("Notes: " + k.notes.slice(-12).join('; '));
+  if (!lines.length) return "I haven't got much on file yet - tell me about your business and I'll remember it. Try \"remember we use Reece for plumbing\" or just mention things as we go.";
+  return "Here's what I've got on file:\n- " + lines.join("\n- ");
+}
+
+// A dedicated, reliable pass that pulls durable business facts out of a message.
+// Runs in PARALLEL with the main reply (no added latency) so passive facts get
+// caught even when the chat model forgets to tag them. Returns an array of strings.
+async function extractFacts(userMessage, knownNotes) {
+  if (!userMessage || userMessage.trim().length < 12) return []; // skip "hi"/"thanks"/"yes"
+  try {
+    const resp = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      max_tokens: 160,
+      messages: [
+        { role: 'system', content: "You pull out durable facts a tradie states about THEIR OWN business that are worth remembering long-term: rates/prices, ABN, licence numbers, preferred brands/materials, how they like jobs done, vehicle/rego, regular sites or arrangements, key people and roles, or anything they explicitly say to remember. IGNORE questions, one-off chit-chat, reminders, and anything already known. Return ONLY a JSON array of short fact strings (e.g. [\"Charges $90/hr\",\"Prefers Reece for plumbing\"]). Return [] if nothing durable. No prose, no code fences." },
+        { role: 'user', content: "Already known: " + JSON.stringify((knownNotes || []).slice(-40)) + "\n\nMessage: " + userMessage }
+      ]
+    });
+    let txt = (resp.choices[0].message.content || '').replace(/```json|```/g, '').trim();
+    const arr = JSON.parse(txt);
+    if (Array.isArray(arr)) return arr.filter(function (x) { return typeof x === 'string' && x.trim() && x.length < 200; }).map(function (x) { return x.trim(); });
+  } catch (e) { console.error('Fact extract failed:', e); }
+  return [];
+}
+
 function parseClientRemove(message) {
   let m = (message || '').match(/\b(?:remove|delete|drop|get rid of)\s+(?:the\s+)?client\s+(.+)$/i);
   if (m && m[1]) return m[1].trim();
@@ -2155,6 +2211,29 @@ app.post('/sms', async function(req, res) {
       await saveUser(userPhone, user);
     }
 
+    // Explicit "remember that ..." / "note ..." -> save it reliably, no AI needed.
+    {
+      const fact = parseRememberFact(userMessage);
+      if (fact) {
+        if (!user.knowledge) user.knowledge = { team: [], suppliers: [], clients: [], notes: [], leads: [] };
+        if (!Array.isArray(user.knowledge.notes)) user.knowledge.notes = [];
+        const had = user.knowledge.notes.some(function (n) { return (n || '').toLowerCase() === fact.toLowerCase(); });
+        if (!had) {
+          user.knowledge.notes.push(fact);
+          if (user.knowledge.notes.length > 100) user.knowledge.notes = user.knowledge.notes.slice(-100);
+          await saveUser(userPhone, user);
+        }
+        twiml.message(had ? "Already had that noted - all good." : "Got it - I'll remember that.");
+        return reply();
+      }
+    }
+
+    // "what do you know about my business" -> show what's on file.
+    if (wantsBusinessRecall(userMessage)) {
+      twiml.message(buildRecallSummary(user));
+      return reply();
+    }
+
     // A client update is drafted and waiting on the boss's "SEND".
     if (user.pendingClientMsg && user.pendingClientMsg.phone) {
       const ans = userMessage.trim().toLowerCase();
@@ -2238,7 +2317,7 @@ app.post('/sms', async function(req, res) {
         if (!user.history) user.history = [];
         user.history.push({ role: 'user', content: '[Photo]' + (caption ? ': ' + caption : '') });
         user.history.push({ role: 'assistant', content: flowReply });
-        if (user.history.length > 20) user.history = user.history.slice(-20);
+        if (user.history.length > 30) user.history = user.history.slice(-30);
         await saveUser(userPhone, user);
 
         twiml.message(flowReply);
@@ -2864,7 +2943,7 @@ app.post('/sms', async function(req, res) {
 
     if (!user.history) user.history = [];
     user.history.push({ role: 'user', content: userMessage });
-    if (user.history.length > 20) { user.history = user.history.slice(-20); }
+    if (user.history.length > 30) { user.history = user.history.slice(-30); }
 
     // Keyword match instead of an OpenAI classifier call (halves per-message cost).
     const shouldSearch = SEARCH_KEYWORDS.some(function(k) {
@@ -2899,11 +2978,14 @@ app.post('/sms', async function(req, res) {
 
     const systemPrompt = "You are Flow, an AI assistant built specifically for Australian construction business owners.\n\nVOICE:\n- Talk like a real person - warm, easy and natural, the way a sharp offsider would text. Professional, but never robotic, formal, or full of corporate fluff.\n- Vary how you reply. Never lean on the same stock phrase, and always put things in your own words. Acknowledge what they actually said.\n- Keep replies short and texty by default - a sentence or two. Use a little more room only when you genuinely need to ask something or explain.\n- Never mention ChatGPT or OpenAI. Always refer to yourself as Flow.\n- Never say you cannot access the internet.\n- Australian spelling and dollars.\n- Always use the user's work areas and state for location based questions.\n- You know their regular suppliers and their biggest admin headache. Reference suppliers by name when ordering or prices come up, and look for natural chances to ease that admin pain.\n\nGETTING TASKS RIGHT (this is critical - getting it exactly right matters far more than being quick):\n- Before you act on ANY task, make sure you have every detail you'd need to do it exactly the way they want. If there's any meaningful uncertainty, anything missing, or anything that could be done more than one way, ASK before you do it. When in doubt, ask - it is always better to ask one more question than to get it wrong or only half right.\n- Don't assume, and don't fill gaps with your best guess. The only things you can take as given are details they've already told you or that are in their profile.\n- Ask EVERY question you need to nail the task - but group them all into ONE message so they can answer in one go. Never drip-feed questions one at a time across several texts.\n- For example: a reminder needs the exact time, the date if it isn't today, and who it involves; chasing a quote needs which job, who the client is, the amount, and the tone or wording they want; a job ad needs the role, area, pay, hours, start date, and how to apply; placing or chasing an order needs the item, quantity, supplier, and when it's needed by.\n- After they answer, read the key details back in plain English and only then do the task - so they get the chance to correct you before it's done.\n- To actually SAVE a crew member or a client, you need their mobile number. If they ask you to add someone and you can't see a number in their message, ASK for it - never say you've added someone when you haven't.\n- Be curious about their business and complete the picture fast. If they give you half of something - a number with no name, a client with no job, a person with no role, a supplier with no category, a job with no address - ask the ONE quick question that fills the gap, then save it. One short question, never an interrogation. The better you understand their business, the more useful you are to them.\n- ALWAYS reply with a real, human sentence. Never reply with only hidden tags - even when you're just noting something down, say something natural back.\n\nWhen search results are provided you MUST use them.\n\nFor each reminder with a clear time, confirm briefly then add it on its OWN new line: REMINDER: [task] | [time]. If they ask for several reminders in one message, output a separate REMINDER: line for every one.\n\nIf the user asks for something you genuinely cannot do, respond warmly in one or two sentences, tell them it is not a current feature, then add on its OWN new line exactly:\nFEATURE_REQUEST: [what they asked for]\n\nAs you chat, quietly learn about the business. When you learn something genuinely new (not already listed below), add it on its OWN new line at the very end of your reply using these tags - do not repeat a tag for something already known:\nLEARN_TEAM: [name] | [role]\nLEARN_SUPPLIER: [name] | [category]\nLEARN_CLIENT: [name] | [notes]\nLEARN_NOTE: [fact]\nLEARN_LEAD: [job or client] | [detail]\nUse LEARN_LEAD when they mention a possible job, enquiry, or quote that hasn't been won yet (e.g. someone asked them to price a job). Also: when they tell you their name or what to call them, add on its own line LEARN_NAME: [name]. These tags are stripped before the user sees the message, so keep them off the lines the user reads.\n\nWhen the user mentions a person's name you don't recognise from the team list, after completing their request ask: 'Is [name] part of your team? I can keep track of them for you.'\n\nUser profile: " + user.businessContext + teamContext + knowledgeContext + summarizeForContext(user) + integrationsContext + "\nName: " + user.name + "\nState: " + user.state + "\nWork areas: " + user.workAreas + "\nWork hours: " + user.workHours + "\nFinish time: " + user.finishTime + "\nRegular suppliers: " + user.suppliers + "\nBiggest admin headache: " + user.adminHeadache + "\nLocal time: " + new Date().toLocaleString('en-AU', { timeZone: userTz }) + searchContext;
 
-    const response = await openai.chat.completions.create({
-      model: 'gpt-4o-mini',
-      messages: [{ role: 'system', content: systemPrompt }].concat(user.history),
-      max_tokens: 250
-    });
+    const [response, extractedFacts] = await Promise.all([
+      openai.chat.completions.create({
+        model: 'gpt-4o-mini',
+        messages: [{ role: 'system', content: systemPrompt }].concat(user.history),
+        max_tokens: 250
+      }),
+      extractFacts(userMessage, (user.knowledge && user.knowledge.notes) || [])
+    ]);
 
     let flowReply = (response.choices[0].message.content || '').trim();
 
@@ -2985,6 +3067,17 @@ app.post('/sms', async function(req, res) {
     if (!flowReply) {
       const acks = ["Got it.", "No worries, sorted.", "Onto it.", "Righto, done.", "All good - got that.", "Easy, locked in."];
       flowReply = acks[Math.floor(Math.random() * acks.length)];
+    }
+
+    // Fold in any durable facts the parallel extractor caught (dedup, capped).
+    if (Array.isArray(extractedFacts) && extractedFacts.length) {
+      if (!user.knowledge) user.knowledge = { team: [], suppliers: [], clients: [], notes: [], leads: [] };
+      if (!Array.isArray(user.knowledge.notes)) user.knowledge.notes = [];
+      for (const f of extractedFacts) {
+        const dup = user.knowledge.notes.some(function (n) { return (n || '').toLowerCase() === f.toLowerCase(); });
+        if (!dup) user.knowledge.notes.push(f);
+      }
+      if (user.knowledge.notes.length > 100) user.knowledge.notes = user.knowledge.notes.slice(-100);
     }
 
     user.history.push({ role: 'assistant', content: flowReply });
