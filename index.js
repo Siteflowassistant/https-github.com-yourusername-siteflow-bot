@@ -19,6 +19,35 @@ const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_A
 
 const ADMIN_PHONE = process.env.ADMIN_PHONE;
 
+// Text the admin (you) a short alert when something breaks, so real errors surface
+// to your phone instead of only the Render logs. Rate-limited so a recurring fault
+// can't spam: the same label fires at most once an hour, and at most ~6 alerts/hour
+// overall. Never alerts on messages to the admin's own number (avoids loops).
+const _alertState = { perLabel: {}, recent: [] };
+async function alertAdmin(label, err) {
+  try {
+    if (!ADMIN_PHONE) return;
+    const now = Date.now();
+    if (_alertState.perLabel[label] && (now - _alertState.perLabel[label]) < 60 * 60 * 1000) return; // 1/hr per label
+    _alertState.recent = _alertState.recent.filter(function (t) { return now - t < 60 * 60 * 1000; });
+    if (_alertState.recent.length >= 6) return; // global cap ~6/hr
+    _alertState.perLabel[label] = now;
+    _alertState.recent.push(now);
+    let detail = '';
+    if (err) detail = (err && err.message) ? err.message : ('' + err);
+    if (detail.length > 250) detail = detail.slice(0, 250) + '...';
+    await twilioClient.messages.create({
+      body: "Flow error - " + label + (detail ? (": " + detail) : ""),
+      from: process.env.TWILIO_PHONE_NUMBER,
+      to: ADMIN_PHONE
+    });
+  } catch (e) { console.error('alertAdmin failed:', e); }
+}
+
+// Crashes that escape a handler still text you, then the logs keep the stack trace.
+process.on('uncaughtException', function (e) { console.error('uncaughtException:', e); alertAdmin('crash (uncaught exception)', e); });
+process.on('unhandledRejection', function (e) { console.error('unhandledRejection:', e); alertAdmin('crash (unhandled promise)', e); });
+
 // Public URL of Flow's photo, sent during onboarding so the user can save it as
 // the contact picture. Set this in your environment (see the setup guide).
 const FLOW_PHOTO_URL = process.env.FLOW_PHOTO_URL;
@@ -83,6 +112,7 @@ function newUser() {
     teamMembers: [],
     clients: [], clientPhones: [],
     reviewLink: '',
+    todos: [],
     // Feature toggles the builder can flip by texting Flow in plain English.
     preferences: {
       weeklySpecials: true,
@@ -136,6 +166,10 @@ function summarizeForContext(user) {
   }
   if (user.payDay) parts.push("Pays/timesheet roundup day: " + user.payDay);
   if (user.reviewLink) parts.push("Google review link: on file");
+  if (Array.isArray(user.todos)) {
+    const open = user.todos.filter(function (t) { return t && !t.done; });
+    if (open.length) parts.push("To-do list (open): " + open.slice(0, 20).map(function (t) { return t.text; }).join('; '));
+  }
   if (Array.isArray(user.logbook) && user.logbook.length) {
     const totalKm = user.logbook.reduce(function (s, e) { return s + (e && e.km ? e.km : 0); }, 0);
     parts.push("Vehicle logbook: " + user.logbook.length + " trips, ~" + Math.round(totalKm) + " km logged");
@@ -437,6 +471,37 @@ function wantsCancelReminder(message) {
   const lower = (message || '').toLowerCase();
   return /\b(cancel|delete|remove|clear|scrap|drop)\b[^\n]*\breminders?\b/.test(lower)
     || /\bforget (the |my )?reminder/.test(lower);
+}
+
+// ----- To-do list: untimed tasks the boss needs to do (vs reminders, which ping at a time) -----
+
+// "add X to my to-do list" / "todo: X" / "put X on my list" -> the task text.
+function parseTodoAdd(message) {
+  let m = (message || '').match(/^\s*(?:hey\s+)?(?:flow[,\s]+)?(?:can you\s+)?(?:please\s+)?(?:add|put|chuck|stick|throw|pop)\s+(.+?)\s+(?:to|on|in)\s+(?:my|the)\s+(?:to[- ]?do(?:\s*list)?|todo(?:\s*list)?|list|tasks?)\s*$/i);
+  if (m && m[1]) return m[1].trim();
+  m = (message || '').match(/^\s*(?:hey\s+)?(?:flow[,\s]+)?to[- ]?do\b[:\-\s]+(.+)$/i);
+  if (m && m[1]) return m[1].trim();
+  return null;
+}
+
+function wantsTodoList(message) {
+  const lower = (message || '').toLowerCase().trim();
+  if (/^(my )?(to[- ]?do|todo)(\s?list)?\??$/.test(lower)) return true;
+  return /\b(show|list|view|see|what'?s? on|whats on|read|check)\b[^\n]*\b(to[- ]?do|todo|task)s?\b/.test(lower);
+}
+
+// "done X" / "tick off X" / "remove X from my list" -> the text to match against todos.
+function parseTodoDone(message) {
+  let m = (message || '').match(/^\s*(?:hey\s+)?(?:flow[,\s]+)?(?:tick off|cross off|check off|mark off|knock off|done with|finished with|completed|done|finished|did|sorted)\s+(.+)$/i);
+  if (m && m[1]) return m[1].replace(/^(?:the|my)\s+/i, '').trim();
+  m = (message || '').match(/\b(?:remove|delete|drop|take)\s+(.+?)\s+(?:from|off)\s+(?:my|the)\s+(?:to[- ]?do|todo|list|tasks?)/i);
+  if (m && m[1]) return m[1].trim();
+  return null;
+}
+
+function wantsClearTodos(message) {
+  const lower = (message || '').toLowerCase();
+  return /\b(clear|empty|wipe|reset)\b[^\n]*\b(to[- ]?do|todo|task)s?\b/.test(lower);
 }
 
 // "morning briefing", "brief me", "what have I got on today", "rundown"...
@@ -1450,13 +1515,11 @@ function nextFirstWeekQuestion(user) {
     candidates.push({ key: 'name', text: "I didn't catch your name - what should I call you?" });
   }
   if (!k.team || k.team.length === 0) {
-    candidates.push({ key: 'team', text: "Who's on your crew? Give me their names and what they do and I'll keep track of who's on what job." });
+    candidates.push({ key: 'team', text: "Who's on your crew? Send me their names and numbers and I'll keep track of who's on what." });
   }
-  candidates.push({ key: 'currentwork', text: "What are you working on at the moment? I'll keep tabs on it and chase up anything that needs following." });
   if (!k.clients || k.clients.length === 0) {
     candidates.push({ key: 'clients', text: "Who are the main clients or builders you work for? Helps me keep your jobs straight." });
   }
-  candidates.push({ key: 'rapport', text: "How long have you been running the show? Good to know who I'm working for." });
 
   for (let i = 0; i < candidates.length; i++) {
     if (asked.indexOf(candidates[i].key) === -1) return candidates[i];
@@ -1682,6 +1745,11 @@ setInterval(async function() {
       if (now < reminder.time) continue;
       const claimed = await claimReminder(reminder.id);
       if (!claimed) continue; // already handled elsewhere - don't double-send
+      // Too stale to be useful (e.g. leftover/buggy docs)? Retire it silently.
+      if (now - reminder.time > 6 * 60 * 60 * 1000) {
+        console.log("Reminder retired (stale): " + reminder.task);
+        continue;
+      }
       const greeting = reminder.name ? ("Hey " + reminder.name + " - ") : "";
       try {
         await twilioClient.messages.create({
@@ -1692,7 +1760,7 @@ setInterval(async function() {
         console.log("Reminder sent: " + reminder.task);
       } catch (err) { console.error('Reminder send failed:', err); }
     }
-  } catch (err) { console.error('Reminder check failed:', err); }
+  } catch (err) { console.error('Reminder check failed:', err); alertAdmin('reminder scheduler', err); }
 }, 60000);
 
 // 2) Proactive check-ins - hourly. In a user's FIRST WEEK, Flow asks getting-to-
@@ -1724,10 +1792,12 @@ setInterval(async function() {
       let body = null;
       const upd = { lastProactiveAt: new Date().toISOString() };
 
-      // ---- First week: getting-to-know-you question (any day) ----
+      // ---- First week: getting-to-know-you question, spaced ~3 days apart ----
       const inFirstWeek = user.signupAt &&
         (Date.now() - new Date(user.signupAt).getTime()) < 7 * 24 * 60 * 60 * 1000;
-      if (inFirstWeek) {
+      const firstWeekSpacingOk = !user.lastProactiveAt ||
+        (Date.now() - new Date(user.lastProactiveAt).getTime()) > 60 * 60 * 60 * 1000; // ~2.5 days
+      if (inFirstWeek && firstWeekSpacingOk) {
         const q = nextFirstWeekQuestion(user);
         if (q) {
           body = (user.name ? ("Hey " + user.name + " - ") : "Hey - ") + q.text;
@@ -1759,12 +1829,7 @@ setInterval(async function() {
         } else if (!user.knowledge || !user.knowledge.team || user.knowledge.team.length === 0) {
           reason = "Is there anyone on your crew I should know about? I can keep track of who's doing what on each job.";
         } else {
-          const nudges = [
-            "Anything on the go I should know about? Happy to take notes, set reminders, or chase something up.",
-            "How's the week shaping up? Sing out if there's a quote to follow, an order to place, or a reminder to set.",
-            "Need me to lock in any reminders or keep tabs on a job today? Just flick me a message."
-          ];
-          reason = nudges[Math.floor(Math.random() * nudges.length)];
+          continue; // nothing genuinely useful to say - stay quiet rather than nag
         }
         body = "Hey " + user.name + " - " + reason;
       }
@@ -1779,7 +1844,7 @@ setInterval(async function() {
         console.log("Proactive sent to: " + phone);
       } catch (err) { console.error("Proactive failed:", err); }
     }
-  } catch (err) { console.error("Proactive scheduler error:", err); }
+  } catch (err) { console.error("Proactive scheduler error:", err); alertAdmin('proactive scheduler', err); }
 }, 60 * 60 * 1000);
 
 // 3) Weekly power-tool specials - hourly check, fires Monday 7-10am local time,
@@ -1833,7 +1898,7 @@ setInterval(async function() {
         console.log("Specials sent to: " + phone);
       } catch (err) { console.error('Specials send failed:', err); }
     }
-  } catch (err) { console.error('Specials scheduler error:', err); }
+  } catch (err) { console.error('Specials scheduler error:', err); alertAdmin('specials scheduler', err); }
 }, 60 * 60 * 1000);
 
 // 4) Morning weather report - hourly check, fires in the 5-8am local window, once
@@ -1852,7 +1917,7 @@ setInterval(async function() {
       if (user.preferences && user.preferences.weatherReports === false) continue;
 
       const wh = localWeekdayHour(tzForState(user.state));
-      if (wh.hour !== 4) continue; // 4am local, every day
+      if (wh.hour < 5 || wh.hour > 7) continue; // morning window 5-7am local
       if (user.lastWeatherAt && (Date.now() - new Date(user.lastWeatherAt).getTime()) < 20 * 60 * 60 * 1000) continue;
 
       let result;
@@ -1873,7 +1938,7 @@ setInterval(async function() {
         console.log("Weather sent to: " + phone);
       } catch (err) { console.error('Weather send failed:', err); }
     }
-  } catch (err) { console.error('Weather scheduler error:', err); }
+  } catch (err) { console.error('Weather scheduler error:', err); alertAdmin('weather scheduler', err); }
 }, 60 * 60 * 1000);
 
 // 5) Evening extreme-weather heads-up - hourly check, fires ~8pm local, once a
@@ -1892,7 +1957,7 @@ setInterval(async function() {
       if (user.preferences && user.preferences.weatherReports === false) continue;
 
       const wh = localWeekdayHour(tzForState(user.state));
-      if (wh.hour !== 20) continue; // 8pm local
+      if (wh.hour < 18 || wh.hour > 21) continue; // evening window 6-9pm local
       if (user.lastWeatherEveningAt && (Date.now() - new Date(user.lastWeatherEveningAt).getTime()) < 20 * 60 * 60 * 1000) continue;
 
       let result;
@@ -1908,7 +1973,7 @@ setInterval(async function() {
         console.log("Evening weather alert sent to: " + phone);
       } catch (err) { console.error('Evening alert send failed:', err); }
     }
-  } catch (err) { console.error('Evening alert scheduler error:', err); }
+  } catch (err) { console.error('Evening alert scheduler error:', err); alertAdmin('evening weather scheduler', err); }
 }, 60 * 60 * 1000);
 
 // 6) Tickets & compliance expiry warnings - hourly check, fires ~7am local once a
@@ -1961,7 +2026,7 @@ setInterval(async function() {
         catch (e) { console.error('Compliance save failed:', e); }
       }
     }
-  } catch (err) { console.error('Compliance scheduler error:', err); }
+  } catch (err) { console.error('Compliance scheduler error:', err); alertAdmin('compliance scheduler', err); }
 }, 60 * 60 * 1000);
 
 // 7) Weekly timesheet roundup to the boss - hourly check, fires Fri ~5pm local,
@@ -1991,7 +2056,7 @@ setInterval(async function() {
         console.log("Weekly timesheet sent to: " + phone);
       } catch (err) { console.error('Weekly timesheet send failed:', err); }
     }
-  } catch (err) { console.error('Timesheet summary scheduler error:', err); }
+  } catch (err) { console.error('Timesheet summary scheduler error:', err); alertAdmin('timesheet scheduler', err); }
 }, 60 * 60 * 1000);
 
 // ============================ SMS WEBHOOK ============================
@@ -2251,6 +2316,57 @@ app.post('/sms', async function(req, res) {
     if (wantsBusinessRecall(userMessage)) {
       twiml.message(buildRecallSummary(user));
       return reply();
+    }
+
+    // ----- To-do list -----
+    {
+      const todoText = parseTodoAdd(userMessage);
+      if (todoText) {
+        if (!Array.isArray(user.todos)) user.todos = [];
+        const dup = user.todos.some(function (t) { return t && !t.done && (t.text || '').toLowerCase() === todoText.toLowerCase(); });
+        if (!dup) {
+          user.todos.push({ text: todoText, done: false, at: new Date().toISOString() });
+          if (user.todos.length > 300) user.todos = user.todos.slice(-300);
+          await saveUser(userPhone, user);
+        }
+        const open = user.todos.filter(function (t) { return t && !t.done; }).length;
+        twiml.message((dup ? "Already on your list" : "Added to your to-do list: " + todoText) + ". " + open + " thing" + (open === 1 ? "" : "s") + " on there now.");
+        return reply();
+      }
+    }
+
+    if (wantsClearTodos(userMessage)) {
+      const open = Array.isArray(user.todos) ? user.todos.filter(function (t) { return t && !t.done; }).length : 0;
+      user.todos = [];
+      await saveUser(userPhone, user);
+      twiml.message(open ? ("Cleared your to-do list (" + open + " gone).") : "Your to-do list was already empty.");
+      return reply();
+    }
+
+    if (wantsTodoList(userMessage)) {
+      const open = Array.isArray(user.todos) ? user.todos.filter(function (t) { return t && !t.done; }) : [];
+      if (!open.length) { twiml.message("Your to-do list is clear. Add something with \"add ... to my to-do list\"."); return reply(); }
+      const lines = open.slice(0, 25).map(function (t, i) { return (i + 1) + ". " + t.text; });
+      twiml.message("Your to-do list (" + open.length + "):\n" + lines.join('\n'));
+      return reply();
+    }
+
+    // "done X" / "tick off X" - mark a to-do complete (only if it matches one).
+    {
+      const doneQ = parseTodoDone(userMessage);
+      if (doneQ && Array.isArray(user.todos)) {
+        const q = doneQ.toLowerCase();
+        const hit = user.todos.find(function (t) { return t && !t.done && (t.text || '').toLowerCase().indexOf(q) !== -1; });
+        if (hit) {
+          hit.done = true;
+          hit.doneAt = new Date().toISOString();
+          await saveUser(userPhone, user);
+          const left = user.todos.filter(function (t) { return t && !t.done; }).length;
+          twiml.message("Nice - ticked off \"" + hit.text + "\". " + (left ? (left + " left on the list.") : "That's your list clear!"));
+          return reply();
+        }
+        // no matching to-do -> fall through (might be a job-done or other intent)
+      }
     }
 
     // A client update is drafted and waiting on the boss's "SEND".
@@ -2995,7 +3111,7 @@ app.post('/sms', async function(req, res) {
       ? "\nThis user has connected Xero. You CAN see their invoices and money owed - if they ask about cash, invoices, or who owes them, that is handled live elsewhere, so just answer naturally and never say you can't access their accounts."
       : "\nThis user has NOT connected Xero yet. If they ask about invoices or money owed, tell them you can pull it from Xero once it's connected and that they can text 'connect Xero' to set it up.";
 
-    const systemPrompt = "You are Flow, an AI assistant built specifically for Australian construction business owners.\n\nVOICE:\n- Talk like a real person - warm, easy and natural, the way a sharp offsider would text. Professional, but never robotic, formal, or full of corporate fluff.\n- Vary how you reply. Never lean on the same stock phrase, and always put things in your own words. Acknowledge what they actually said.\n- Keep replies short and texty by default - a sentence or two. Use a little more room only when you genuinely need to ask something or explain.\n- Never mention ChatGPT or OpenAI. Always refer to yourself as Flow.\n- Never say you cannot access the internet.\n- Australian spelling and dollars.\n- Always use the user's work areas and state for location based questions.\n- You know their regular suppliers and their biggest admin headache. Reference suppliers by name when ordering or prices come up, and look for natural chances to ease that admin pain.\n\nGETTING TASKS RIGHT (this is critical - getting it exactly right matters far more than being quick):\n- Before you act on ANY task, make sure you have every detail you'd need to do it exactly the way they want. If there's any meaningful uncertainty, anything missing, or anything that could be done more than one way, ASK before you do it. When in doubt, ask - it is always better to ask one more question than to get it wrong or only half right.\n- Don't assume, and don't fill gaps with your best guess. The only things you can take as given are details they've already told you or that are in their profile.\n- Ask EVERY question you need to nail the task - but group them all into ONE message so they can answer in one go. Never drip-feed questions one at a time across several texts.\n- For example: a reminder needs the exact time, the date if it isn't today, and who it involves; chasing a quote needs which job, who the client is, the amount, and the tone or wording they want; a job ad needs the role, area, pay, hours, start date, and how to apply; placing or chasing an order needs the item, quantity, supplier, and when it's needed by.\n- After they answer, read the key details back in plain English and only then do the task - so they get the chance to correct you before it's done.\n- To actually SAVE a crew member or a client, you need their mobile number. If they ask you to add someone and you can't see a number in their message, ASK for it - never say you've added someone when you haven't.\n- Be curious about their business and complete the picture fast. If they give you half of something - a number with no name, a client with no job, a person with no role, a supplier with no category, a job with no address - ask the ONE quick question that fills the gap, then save it. One short question, never an interrogation. The better you understand their business, the more useful you are to them.\n- ALWAYS reply with a real, human sentence. Never reply with only hidden tags - even when you're just noting something down, say something natural back.\n\nWhen search results are provided you MUST use them.\n\nFor each reminder with a clear time, confirm briefly then add it on its OWN new line: REMINDER: [task] | [time]. If they ask for several reminders in one message, output a separate REMINDER: line for every one.\n\nIf the user asks for something you genuinely cannot do, respond warmly in one or two sentences, tell them it is not a current feature, then add on its OWN new line exactly:\nFEATURE_REQUEST: [what they asked for]\n\nAs you chat, quietly learn about the business. When you learn something genuinely new (not already listed below), add it on its OWN new line at the very end of your reply using these tags - do not repeat a tag for something already known:\nLEARN_TEAM: [name] | [role]\nLEARN_SUPPLIER: [name] | [category]\nLEARN_CLIENT: [name] | [notes]\nLEARN_NOTE: [fact]\nLEARN_LEAD: [job or client] | [detail]\nUse LEARN_LEAD when they mention a possible job, enquiry, or quote that hasn't been won yet (e.g. someone asked them to price a job). Also: when they tell you their name or what to call them, add on its own line LEARN_NAME: [name]. These tags are stripped before the user sees the message, so keep them off the lines the user reads.\n\nWhen the user mentions a person's name you don't recognise from the team list, after completing their request ask: 'Is [name] part of your team? I can keep track of them for you.'\n\nUser profile: " + user.businessContext + teamContext + knowledgeContext + summarizeForContext(user) + integrationsContext + "\nName: " + user.name + "\nState: " + user.state + "\nWork areas: " + user.workAreas + "\nWork hours: " + user.workHours + "\nFinish time: " + user.finishTime + "\nRegular suppliers: " + user.suppliers + "\nBiggest admin headache: " + user.adminHeadache + "\nLocal time: " + new Date().toLocaleString('en-AU', { timeZone: userTz }) + searchContext;
+    const systemPrompt = "You are Flow, an AI assistant built specifically for Australian construction business owners.\n\nVOICE:\n- Talk like a real person - warm, easy and natural, the way a sharp offsider would text. Professional, but never robotic, formal, or full of corporate fluff.\n- Vary how you reply. Never lean on the same stock phrase, and always put things in your own words. Acknowledge what they actually said.\n- Keep replies short and texty by default - a sentence or two. Use a little more room only when you genuinely need to ask something or explain.\n- Never mention ChatGPT or OpenAI. Always refer to yourself as Flow.\n- Never say you cannot access the internet.\n- Australian spelling and dollars.\n- Always use the user's work areas and state for location based questions.\n- You know their regular suppliers and their biggest admin headache. Reference suppliers by name when ordering or prices come up, and look for natural chances to ease that admin pain.\n\nGETTING TASKS RIGHT (this is critical - getting it exactly right matters far more than being quick):\n- Before you act on ANY task, make sure you have every detail you'd need to do it exactly the way they want. If there's any meaningful uncertainty, anything missing, or anything that could be done more than one way, ASK before you do it. When in doubt, ask - it is always better to ask one more question than to get it wrong or only half right.\n- Don't assume, and don't fill gaps with your best guess. The only things you can take as given are details they've already told you or that are in their profile.\n- Ask EVERY question you need to nail the task - but group them all into ONE message so they can answer in one go. Never drip-feed questions one at a time across several texts.\n- For example: a reminder needs the exact time, the date if it isn't today, and who it involves; chasing a quote needs which job, who the client is, the amount, and the tone or wording they want; a job ad needs the role, area, pay, hours, start date, and how to apply; placing or chasing an order needs the item, quantity, supplier, and when it's needed by.\n- After they answer, read the key details back in plain English and only then do the task - so they get the chance to correct you before it's done.\n- To actually SAVE a crew member or a client, you need their mobile number. If they ask you to add someone and you can't see a number in their message, ASK for it - never say you've added someone when you haven't.\n- Be curious about their business and complete the picture fast. If they give you half of something - a number with no name, a client with no job, a person with no role, a supplier with no category, a job with no address - ask the ONE quick question that fills the gap, then save it. One short question, never an interrogation. The better you understand their business, the more useful you are to them.\n- ALWAYS reply with a real, human sentence. Never reply with only hidden tags - even when you're just noting something down, say something natural back.\n\nWhen search results are provided you MUST use them.\n\nFor each reminder with a clear time, confirm briefly then add it on its OWN new line: REMINDER: [task] | [time]. If they ask for several reminders in one message, output a separate REMINDER: line for every one.\n\nFor something they need to DO but with no specific time, add it to their to-do list on its OWN new line: TODO: [task] (one line per task). Use REMINDER for timed things and TODO for untimed tasks - never both for the same item. Still reply with a natural sentence; the TODO line is stripped before they see it.\n\nIf the user asks for something you genuinely cannot do, respond warmly in one or two sentences, tell them it is not a current feature, then add on its OWN new line exactly:\nFEATURE_REQUEST: [what they asked for]\n\nAs you chat, quietly learn about the business. When you learn something genuinely new (not already listed below), add it on its OWN new line at the very end of your reply using these tags - do not repeat a tag for something already known:\nLEARN_TEAM: [name] | [role]\nLEARN_SUPPLIER: [name] | [category]\nLEARN_CLIENT: [name] | [notes]\nLEARN_NOTE: [fact]\nLEARN_LEAD: [job or client] | [detail]\nUse LEARN_LEAD when they mention a possible job, enquiry, or quote that hasn't been won yet (e.g. someone asked them to price a job). Also: when they tell you their name or what to call them, add on its own line LEARN_NAME: [name]. These tags are stripped before the user sees the message, so keep them off the lines the user reads.\n\nWhen the user mentions a person's name you don't recognise from the team list, after completing their request ask: 'Is [name] part of your team? I can keep track of them for you.'\n\nUser profile: " + user.businessContext + teamContext + knowledgeContext + summarizeForContext(user) + integrationsContext + "\nName: " + user.name + "\nState: " + user.state + "\nWork areas: " + user.workAreas + "\nWork hours: " + user.workHours + "\nFinish time: " + user.finishTime + "\nRegular suppliers: " + user.suppliers + "\nBiggest admin headache: " + user.adminHeadache + "\nLocal time: " + new Date().toLocaleString('en-AU', { timeZone: userTz }) + searchContext;
 
     const [response, extractedFacts] = await Promise.all([
       openai.chat.completions.create({
@@ -3029,6 +3145,22 @@ app.post('/sms', async function(req, res) {
       console.log("Reminder saved: " + task + " for " + parsedTime);
     }
 
+    // --- TODO side-effect: untimed tasks the model flagged for the to-do list ---
+    const todoRe = /^\s*TODO:\s*(.+)$/gim;
+    let todoMatch;
+    const seenTodos = {};
+    while ((todoMatch = todoRe.exec(flowReply)) !== null) {
+      const text = todoMatch[1].trim().replace(/[.!]+$/, '');
+      if (!text) continue;
+      const key = text.toLowerCase();
+      if (seenTodos[key]) continue;
+      seenTodos[key] = true;
+      if (!Array.isArray(user.todos)) user.todos = [];
+      const dup = user.todos.some(function (t) { return t && !t.done && (t.text || '').toLowerCase() === key; });
+      if (!dup) user.todos.push({ text: text, done: false, at: new Date().toISOString() });
+    }
+    if (Array.isArray(user.todos) && user.todos.length > 300) user.todos = user.todos.slice(-300);
+
     // --- FEATURE_REQUEST side-effect ---
     const featureMatch = flowReply.match(/FEATURE_REQUEST:\s*(.+)/);
     if (featureMatch) {
@@ -3045,7 +3177,7 @@ app.post('/sms', async function(req, res) {
       const line = replyLines[li];
       const t = line.trim();
       let m;
-      if (/^REMINDER:/i.test(t) || /^FEATURE_REQUEST:/i.test(t)) {
+      if (/^REMINDER:/i.test(t) || /^FEATURE_REQUEST:/i.test(t) || /^TODO:/i.test(t)) {
         continue; // already handled above
       } else if ((m = t.match(/^LEARN_TEAM:\s*(.+)/i))) {
         const parts = m[1].split('|').map(function(s) { return s.trim(); });
@@ -3113,6 +3245,7 @@ app.post('/sms', async function(req, res) {
 
   } catch (err) {
     console.error('Unhandled /sms error:', err);
+    alertAdmin('message handling', err);
     if (!res.headersSent) {
       const t = new twilio.twiml.MessagingResponse();
       t.message("Flow hit a snag - send that last message again in a moment.");
