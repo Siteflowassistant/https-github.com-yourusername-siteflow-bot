@@ -1901,8 +1901,9 @@ setInterval(async function() {
   } catch (err) { console.error('Specials scheduler error:', err); alertAdmin('specials scheduler', err); }
 }, 60 * 60 * 1000);
 
-// 4) Morning weather report - hourly check, fires in the 5-8am local window, once
-// per day, opt-out via "stop weather". Funny weather-reporter style, with a next-day
+// 4) Morning weather report - checks every 15 min, fires once in the 5-7am local
+// window, once per day, opt-out via "stop weather". Runs for every onboarded user
+// regardless of activity. Funny weather-reporter style, with a next-day
 // heads-up folded into the same message when tomorrow looks extreme.
 setInterval(async function() {
   try {
@@ -1939,7 +1940,7 @@ setInterval(async function() {
       } catch (err) { console.error('Weather send failed:', err); }
     }
   } catch (err) { console.error('Weather scheduler error:', err); alertAdmin('weather scheduler', err); }
-}, 60 * 60 * 1000);
+}, 15 * 60 * 1000);
 
 // 5) Evening extreme-weather heads-up - hourly check, fires ~8pm local, once a
 // day, and ONLY when tomorrow is extreme (38C+ heat or 25mm+ rain). Shares the
