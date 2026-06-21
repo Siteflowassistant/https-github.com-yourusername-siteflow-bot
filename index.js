@@ -229,6 +229,27 @@ function localWeekdayHour(tz) {
   return { weekday: parts.weekday, hour: hour };
 }
 
+// Decide whether a short reply is plausibly a place/area answer (so we capture it
+// as their work area) versus an actual command or question (which we must NOT eat).
+// Strips polite lead-ins like "we mainly work around ..." and returns the cleaned
+// place string, or null if it doesn't look like an area.
+function looksLikeArea(text) {
+  let s = (text || '').trim();
+  if (!s || s.length > 60 || s.includes('?')) return null;
+  s = s.replace(/^(yeah|yep|yes|sure|ok(?:ay)?|well|um|uh|nah)[,\s]+/i, '');
+  s = s.replace(/^(i|we)\s+(?:mainly\s+|mostly\s+|usually\s+)?(?:work|operate|am based|are based|live|stay)\s+(?:in|around|out of|near|over)\s+/i, '');
+  s = s.replace(/^(?:based|located)\s+(?:in|around|near)\s+/i, '');
+  s = s.replace(/^(?:mainly\s+|mostly\s+|usually\s+)?(?:in|around|near|out of|over)\s+/i, '');
+  s = s.replace(/^(?:it'?s|its|i'?m in|im in|we'?re in|were in)\s+/i, '');
+  s = s.replace(/[.!]+$/, '').trim();
+  if (!s || s.length < 2 || s.length > 45) return null;
+  // Place-like: letters plus spaces, commas, hyphens, &, / and apostrophes only.
+  if (!/^[a-zA-Z][a-zA-Z\s,&/'\-]+$/.test(s)) return null;
+  // Reject anything that opens like a command or question.
+  if (/^(remind|add|send|show|cancel|stop|help|what|when|where|how|why|who|can|could|do|does|is|are|tell|give|set|make|update|change|book|find|call|text|email|thanks?|no|not)\b/i.test(s)) return null;
+  return s;
+}
+
 // Local calendar date ("YYYY-MM-DD") in a timezone, for "is this today?" checks.
 function localDateKey(tz, date) {
   return new Intl.DateTimeFormat('en-CA', {
@@ -2221,9 +2242,15 @@ app.post('/sms', async function(req, res) {
       user.onboarded = true;
       user.step = 'done';
       user.signupAt = new Date().toISOString(); // starts the first-week getting-to-know-you clock
+      // If signup didn't capture where they work, ask over SMS - we need it for
+      // weather and anything location-based. The reply is captured next message.
+      if (!user.workAreas) user.awaitingWorkArea = true;
       await saveUser(userPhone, user);
       const hi = user.name ? ("Thanks " + user.name + " - ") : "Thanks - ";
       let doneMsg = hi + "that's everything sorted. I've got your back from here. Whenever something needs doing, just tell me and I'll keep you on track.";
+      if (user.awaitingWorkArea) {
+        doneMsg += "\n\nOne quick thing - what area do you mainly work in? Helps me nail your weather and anything local.";
+      }
       // Same-number dual-role: if they still clock in for a boss, remind them how.
       try {
         const stillCrew = await findCrewMembership(userPhone);
@@ -2258,6 +2285,27 @@ app.post('/sms', async function(req, res) {
           return reply();
         }
       }
+    }
+
+    // Capture the work-area answer Flow asked for at signup-finish. One-shot, so
+    // we never nag: if the reply isn't a place, we drop the flag and let their
+    // message be handled normally below.
+    if (user.awaitingWorkArea) {
+      const area = looksLikeArea(userMessage);
+      user.awaitingWorkArea = false;
+      if (area) {
+        user.workAreas = area;
+        user.businessContext = buildBusinessContext(user);
+        user.weatherGeo = null; // force a fresh geocode for the new area
+        try {
+          const geo = await geocodeForUser(user);
+          if (geo) user.weatherGeo = geo;
+        } catch (e) { console.error('Area geocode failed:', e); }
+        await saveUser(userPhone, user);
+        twiml.message("Beauty - got you down for " + area + ". I'll use that for your weather and anything local.");
+        return reply();
+      }
+      await saveUser(userPhone, user); // store the cleared flag, then fall through
     }
 
     // Flow asked for a name to finish saving a crew member or client.
