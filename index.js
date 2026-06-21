@@ -2634,27 +2634,40 @@ app.post('/sms', async function(req, res) {
       return reply();
     }
 
-    // "Any work going? / find me tenders" - public work + tender search.
+    // "Any work going? / find me tenders" - on-demand job-lead search for the
+    // user's trade and area. Uses searchWebLinks so Flow can hand back a real link
+    // to view or bid. Told never to invent a listing, date, or url - and a code
+    // guard below strips any url that didn't come verbatim from the results.
     if (wantsLeadSearch(userMessage)) {
       try {
         const region = user.state || 'Australia';
         const trade = user.trade || 'construction';
         const area = user.workAreas ? (user.workAreas + ' ') : '';
-        const q = trade + ' tenders contracts work available ' + area + region + ' Australia AusTender Tenderlink construction';
-        const results = await searchWeb(q);
-        if (!results || /unavailable|no search results|could not (parse|decode)/i.test(results)) {
+        const q = trade + ' jobs work available tenders contracts ' + area + region + ' Australia AusTender Tenderlink';
+        const results = await searchWebLinks(q);
+        if (!Array.isArray(results) || results.length === 0) {
           twiml.message("Couldn't turn up any open work right now - I'll keep an eye out. Want me to set a reminder to check again next week?");
           return reply();
         }
+        const resultsText = results.map(function(r, i) {
+          return (i + 1) + '. ' + r.title + '\n   ' + (r.description || '') + '\n   LINK: ' + r.url;
+        }).join('\n');
         const resp = await openai.chat.completions.create({
-          model: 'gpt-4o-mini', max_tokens: 200,
+          model: 'gpt-4o-mini', max_tokens: 240,
           messages: [
-            { role: 'system', content: "You are Flow, helping an Australian " + trade + " in " + region + " find work. From the web results, pull the most relevant open tenders or available jobs for this trade and area. List the best one or two: what it is, where, and the closing date if shown. Australian spelling. Max three short sentences. Be honest - if nothing in the results clearly fits, say you didn't find a solid match this time. Never invent listings or dates." },
-            { role: 'user', content: results }
+            { role: 'system', content: "You are Flow, helping an Australian " + trade + " in " + (area || region) + " find work. From the search results below, pick the best one or two that are genuinely relevant open jobs or tenders for THIS trade and area. For each, give: what it is, roughly where, the closing date ONLY if it's actually shown, and the link to view it. Use the exact LINK url from the results - never invent or alter a url, date, or listing. Leave out anything that isn't clearly relevant work for this trade. If nothing is a solid match, say so honestly and don't pad. Australian spelling. Keep it short and texty - about 4 short lines per lead, max two leads." },
+            { role: 'user', content: resultsText }
           ]
         });
         let pick = (resp.choices[0].message.content || '').trim();
-        if (!pick) pick = "Nothing solid came up this time - I'll keep looking.";
+        // Code guard: keep only urls that came verbatim from the real results, so
+        // a hallucinated link can never reach the user. (Facts handled in code.)
+        const allowedUrls = results.map(function(r) { return r.url; });
+        pick = pick.replace(/https?:\/\/[^\s)]+/g, function(u) {
+          const clean = u.replace(/[.,;]+$/, '');
+          return allowedUrls.indexOf(clean) !== -1 ? clean : '';
+        }).replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+        if (!pick) pick = "Nothing solid came up this time - I'll keep looking. Want me to check again next week?";
         twiml.message(pick);
       } catch (err) {
         console.error('Lead search failed:', err);
