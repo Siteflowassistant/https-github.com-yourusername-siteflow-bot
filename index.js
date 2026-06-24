@@ -64,6 +64,50 @@ const XERO_REDIRECT_URI = APP_BASE_URL + '/callback/xero';
 // Read-only scopes + offline_access so we get a refresh token.
 const XERO_SCOPES = 'openid profile email offline_access accounting.transactions.read accounting.reports.read accounting.contacts.read';
 
+// ===== Scheduler / "always awake" control =====
+// Flow's scheduled jobs (reminders, weather, specials, compliance, timesheets) run
+// on in-process setInterval timers. Those only tick while THIS process is alive -
+// a redeploy, crash, or idle spin-down stops them, which is how a reminder gets
+// missed. To make Flow genuinely 24/7, drive the jobs from an EXTERNAL clock:
+//   1. Set CRON_SECRET to a long random string (env var).
+//   2. In Render (or cron-job.org / UptimeRobot), create cron jobs that GET:
+//        <APP_BASE_URL>/cron/reminders?key=<CRON_SECRET>     (every minute)
+//        <APP_BASE_URL>/cron/proactive?key=<CRON_SECRET>     (hourly)
+//        <APP_BASE_URL>/cron/specials?key=<CRON_SECRET>      (hourly)
+//        <APP_BASE_URL>/cron/weather-morning?key=<CRON_SECRET>(every 15 min)
+//        <APP_BASE_URL>/cron/weather-evening?key=<CRON_SECRET>(hourly)
+//        <APP_BASE_URL>/cron/compliance?key=<CRON_SECRET>    (hourly)
+//        <APP_BASE_URL>/cron/timesheets?key=<CRON_SECRET>    (hourly)
+//   3. Set SCHEDULERS_INTERNAL=false so the in-process timers switch OFF and the
+//      same job can't fire twice.
+// Until you do that, the internal timers run by default (unchanged behaviour).
+const SCHEDULERS_INTERNAL = process.env.SCHEDULERS_INTERNAL !== 'false';
+const CRON_SECRET = process.env.CRON_SECRET || '';
+
+/* =============================================================================
+ * DEFERRED - NOT BUILT YET (kept here so we remember; each is isolated to add)
+ *  Security (do before any real public exposure):
+ *   - Twilio webhook signature verification on /sms  [HIGHEST priority]
+ *   - Per-number rate limiting on /sms
+ *   - Stop logging full message text + phone numbers to stdout
+ *   - Encrypt Xero refresh tokens at rest (currently plaintext in Firestore)
+ *  Reliability / scale:
+ *   - Wire external cron to the /cron endpoints + set SCHEDULERS_INTERNAL=false
+ *     (endpoints + toggle now EXIST; this is an ops step, not code)
+ *   - Move timesheets/logbook/history into Firestore subcollections before the
+ *     1MB per-document ceiling is hit
+ *   - Replace full-doc saveUser() with field-level updates (removes write race)
+ *  Memory (deeper than this pass):
+ *   - Structured multi-step task state, e.g. an "invoice/quote in progress" object,
+ *     so Flow gathers details ONCE and never re-asks mid-task
+ *   - Conversation summarisation for memory beyond the rolling message window
+ *   - Log command-branch assistant replies into history (inbound is logged now;
+ *     replies from non-AI branches still aren't)
+ *  Business:
+ *   - WhatsApp / RCS channel to fix SMS unit economics
+ *   - Resolve the "SiteFlow" naming/trademark clash (not a code task)
+ * ============================================================================= */
+
 // Keyword list that replaces the old "do I need to search?" LLM call.
 // Defined once at module level so it isn't rebuilt on every request.
 const SEARCH_KEYWORDS = [
@@ -113,6 +157,7 @@ function newUser() {
     clients: [], clientPhones: [],
     reviewLink: '',
     todos: [],
+    shops: [], buysOften: [], setupStep: 0,
     // Feature toggles the builder can flip by texting Flow in plain English.
     preferences: {
       weeklySpecials: true,
@@ -164,6 +209,12 @@ function summarizeForContext(user) {
   if (Array.isArray(user.compliance) && user.compliance.length) {
     parts.push("Tickets/licences + expiry: " + user.compliance.slice(0, 25).map(function (c) { return c.label + " expires " + c.expiry; }).join('; '));
   }
+  if (Array.isArray(user.shops) && user.shops.length) {
+    parts.push("Where they shop for materials/tools: " + user.shops.slice(0, 12).join(', '));
+  }
+  if (Array.isArray(user.buysOften) && user.buysOften.length) {
+    parts.push("Frequently buys: " + user.buysOften.slice(0, 20).join(', '));
+  }
   if (user.payDay) parts.push("Pays/timesheet roundup day: " + user.payDay);
   if (user.reviewLink) parts.push("Google review link: on file");
   if (Array.isArray(user.todos)) {
@@ -193,6 +244,76 @@ function normalizeAuPhone(raw) {
   if (p.startsWith('61')) return '+' + p;
   if (p.length === 9 && p.startsWith('4')) return '+61' + p;
   return '+61' + p;
+}
+
+// ===== State/region parsing for signup + guided setup =====
+// From a reply like "Geelong, VIC" or "Brisbane QLD" pull out BOTH the state
+// (drives timezone) and the work area (drives weather geocoding). Either can be ''.
+function parseStateAndArea(text) {
+  let s = (text || '').trim();
+  if (!s) return { state: '', area: '' };
+  s = s.replace(/^(yeah|yep|yes|sure|ok(?:ay)?|well|um|uh|nah)[,\s]+/i, '');
+  s = s.replace(/^(i|we)\s+(?:mainly\s+|mostly\s+|usually\s+)?(?:work|operate|am based|are based|live|stay)\s+(?:in|around|out of|near|over)\s+/i, '');
+  const STATES = [
+    { state: 'QLD', re: /\b(qld|queensland)\b/i }, { state: 'NSW', re: /\b(nsw|new south wales)\b/i },
+    { state: 'VIC', re: /\b(vic|victoria)\b/i },  { state: 'SA',  re: /\b(south australia|s\.?a\.?)\b/i },
+    { state: 'WA',  re: /\b(western australia|w\.?a\.?)\b/i }, { state: 'TAS', re: /\b(tas|tassie|tasmania)\b/i },
+    { state: 'NT',  re: /\b(northern territory|n\.?t\.?)\b/i }, { state: 'ACT', re: /\b(act|canberra)\b/i }
+  ];
+  let state = '';
+  for (const sp of STATES) { if (sp.re.test(s)) { state = sp.state; s = s.replace(sp.re, ' '); break; } }
+  let area = s.replace(/[^a-zA-Z\s,&/'\-]/g, ' ').replace(/\s{2,}/g, ' ').replace(/^[\s,]+|[\s,]+$/g, '').trim();
+  if (area.length > 60) area = area.slice(0, 60).trim();
+  return { state: state, area: area };
+}
+
+// ===== Guided setup (opt-in walkthrough) helpers =====
+const SETUP_ORDER = ['name', 'location', 'trade', 'hours', 'shops', 'crew', 'payday', 'review'];
+
+function setupAlreadyHave(key, user) {
+  switch (key) {
+    case 'name':     return !!user.name;
+    case 'location': return !!(user.state && user.workAreas);
+    case 'trade':    return !!user.trade;
+    case 'hours':    return !!user.workHours;
+    case 'shops':    return Array.isArray(user.shops) && user.shops.length > 0;
+    case 'crew':     return Array.isArray(user.crew) && user.crew.length > 0;
+    case 'payday':   return !!user.payDay;
+    case 'review':   return !!user.reviewLink;
+  }
+  return true;
+}
+
+function nextSetupIndex(user, fromIdx) {
+  for (let i = fromIdx; i < SETUP_ORDER.length; i++) {
+    if (!setupAlreadyHave(SETUP_ORDER[i], user)) return i;
+  }
+  return -1;
+}
+
+function setupQuestion(key) {
+  switch (key) {
+    case 'name':     return "First up - what should I call you?";
+    case 'location': return "What state are you in, and what area/suburbs do you mainly work? (e.g. \"Geelong, VIC\")";
+    case 'trade':    return "What's your trade? (e.g. carpenter, plumber, sparky)";
+    case 'hours':    return "What hours do you usually work? (e.g. \"7 to 3:30\")";
+    case 'shops':    return "Where do you normally buy materials and tools? (e.g. Bunnings, Reece, Total Tools) - list as many as you like.";
+    case 'crew':     return "Anyone on your crew I should know about? Send a name + mobile (e.g. \"Jacko 0412 345 678\"), or skip - you can add more anytime.";
+    case 'payday':   return "What day do you do pays? I'll send the week's timesheets that arvo. (e.g. \"Thursday\", or skip)";
+    case 'review':   return "Got a Google review link? Paste it and I'll offer to chase reviews when you finish a job. (or skip)";
+  }
+  return null;
+}
+
+// Split "Bunnings, Reece and Total Tools" into a clean list. Reused for shops + buy-list.
+function parseCommaItems(text) {
+  let s = (text || '')
+    .replace(/\b(i (?:usually |normally |mainly |often )?(?:shop|buy|get|grab|purchase)(?: (?:at|from|my))?)\b/gi, ' ')
+    .replace(/\b(and|&|plus)\b/gi, ',');
+  return s.split(/[,/;\n]+/)
+    .map(function (x) { return x.replace(/[^a-zA-Z0-9 '&\-]/g, ' ').replace(/\s+/g, ' ').trim(); })
+    .filter(function (x) { return x.length >= 2 && x.length <= 40; })
+    .slice(0, 12);
 }
 
 // ---- Reminder times are parsed in the USER's timezone (derived from their state)
@@ -417,6 +538,8 @@ function backfillUser(user) {
   if (typeof user.signupAt === 'undefined') user.signupAt = null;
   if (!Array.isArray(user.firstWeekAsked)) user.firstWeekAsked = [];
   if (!user.integrations) user.integrations = { xero: null, gmail: null };
+  if (!Array.isArray(user.shops)) user.shops = [];
+  if (!Array.isArray(user.buysOften)) user.buysOften = [];
   if (!Array.isArray(user.pendingReminders)) {
     user.pendingReminders = (user.pendingReminderTask && user.pendingReminderTask !== '')
       ? [user.pendingReminderTask] : [];
@@ -884,6 +1007,8 @@ function buildRecallSummary(user) {
   if (user.name || user.trade) lines.push("You: " + [user.name, user.trade, user.state].filter(Boolean).join(', '));
   if (Array.isArray(user.crew) && user.crew.length) lines.push("Crew: " + user.crew.map(function (c) { return c.name; }).join(', '));
   if (Array.isArray(user.clients) && user.clients.length) lines.push("Clients: " + user.clients.map(function (c) { return c.name + (c.job ? (" (" + c.job + ")") : ""); }).join(', '));
+  if (Array.isArray(user.shops) && user.shops.length) lines.push("Shops: " + user.shops.join(', '));
+  if (Array.isArray(user.buysOften) && user.buysOften.length) lines.push("Buys often: " + user.buysOften.join(', '));
   if (Array.isArray(k.suppliers) && k.suppliers.length) lines.push("Suppliers: " + k.suppliers.map(function (s) { return s.name + (s.category ? (" (" + s.category + ")") : ""); }).join(', '));
   if (Array.isArray(k.team) && k.team.length) lines.push("People: " + k.team.map(function (t) { return t.name + (t.role ? (" (" + t.role + ")") : ""); }).join(', '));
   if (Array.isArray(user.compliance) && user.compliance.length) lines.push("Tickets: " + user.compliance.map(function (c) { return c.label + " (exp " + c.expiry + ")"; }).join(', '));
@@ -1750,14 +1875,18 @@ async function buildBriefing(user, phone, tz) {
 }
 
 // ============================ SCHEDULERS ============================
-// NOTE: these rely on the process staying awake. On a Render instance that
-// spins down when idle they will NOT run reliably - use an always-on instance
-// or an external scheduler (e.g. Render Cron Jobs) hitting an endpoint.
+// Each job is a named async function so it can be triggered two ways:
+//   (a) the in-process setInterval timers registered at the bottom (default), or
+//   (b) an external cron hitting /cron/<job> (set SCHEDULERS_INTERNAL=false to use
+//       only that, so a sleeping/restarting instance never misses a send).
+// The functions are idempotent enough to run from either path: reminders are
+// claimed atomically, and the others guard on local-time windows + a "lastXAt"
+// timestamp so an extra run won't double-send.
 
-// 1) Reminder poller - fires due reminders every minute. Claims each reminder
-// atomically BEFORE sending, so a slow send, an overlapping tick, a restart, or a
-// second instance can never fire the same reminder twice.
-setInterval(async function() {
+// 1) Reminder poller - fires due reminders. Claims each reminder atomically BEFORE
+// sending, so a slow send, an overlapping run, a restart, or a second instance can
+// never fire the same reminder twice.
+async function schedReminders() {
   try {
     const now = new Date();
     const reminders = await getPendingReminders();
@@ -1782,13 +1911,13 @@ setInterval(async function() {
       } catch (err) { console.error('Reminder send failed:', err); }
     }
   } catch (err) { console.error('Reminder check failed:', err); alertAdmin('reminder scheduler', err); }
-}, 60000);
+}
 
-// 2) Proactive check-ins - hourly. In a user's FIRST WEEK, Flow asks getting-to-
-// know-you questions on any day (great for re-engaging quiet new signups). After
-// that, it settles into 3 friendly check-ins a week (Mon/Wed/Fri). One per day,
-// daytime only, opt-in, and never on top of an active conversation.
-setInterval(async function() {
+// 2) Proactive check-ins. In a user's FIRST WEEK, Flow asks getting-to-know-you
+// questions on any day (great for re-engaging quiet new signups). After that, it
+// settles into 3 friendly check-ins a week (Mon/Wed/Fri). One per day, daytime
+// only, opt-in, and never on top of an active conversation.
+async function schedProactive() {
   try {
     const CHECKIN_DAYS = ['Mon', 'Wed', 'Fri']; // 3 times a week, steady state
 
@@ -1845,6 +1974,10 @@ setInterval(async function() {
           reason = "You mentioned " + leadToChase.label + " a while back - did that go anywhere? Happy to set a follow-up or close it off.";
           leadToChase.lastAskedAt = new Date().toISOString();
           upd.knowledge = user.knowledge; // persist the lead's lastAskedAt
+        } else if ((!user.buysOften || !user.buysOften.length) && !user.buyListAsked) {
+          reason = "Quiet moment - what tools or materials do you buy most often? I'll keep an eye out for specials on them.";
+          upd.buyListAsked = true;
+          upd.awaitingBuyList = true;
         } else if (!user.knowledge || !user.knowledge.suppliers || user.knowledge.suppliers.length === 0) {
           reason = "Do you have any go-to suppliers I should know about? It helps me keep an eye on prices and remind you about orders.";
         } else if (!user.knowledge || !user.knowledge.team || user.knowledge.team.length === 0) {
@@ -1866,11 +1999,12 @@ setInterval(async function() {
       } catch (err) { console.error("Proactive failed:", err); }
     }
   } catch (err) { console.error("Proactive scheduler error:", err); alertAdmin('proactive scheduler', err); }
-}, 60 * 60 * 1000);
+}
 
-// 3) Weekly power-tool specials - hourly check, fires Monday 7-10am local time,
-// opt-in only, max once every 6 days, and ONLY when there's a real special to send.
-setInterval(async function() {
+// 3) Weekly power-tool specials - fires Monday 7-10am local time, opt-in only, max
+// once every 6 days, and ONLY when there's a real special to send. Targets the
+// shops + items the user told Flow they buy (falls back to generic if unknown).
+async function schedSpecials() {
   try {
     const snapshot = await db.collection('users')
       .where('onboarded', '==', true)
@@ -1889,7 +2023,9 @@ setInterval(async function() {
 
       const trade = user.trade || 'tradie';
       const region = user.state || 'Australia';
-      const query = 'power tool specials sale this week ' + region + ' Australia Bunnings Total Tools Sydney Tools ' + trade;
+      const shops = (Array.isArray(user.shops) && user.shops.length) ? user.shops.slice(0, 5).join(' ') : 'Bunnings Total Tools Sydney Tools';
+      const items = (Array.isArray(user.buysOften) && user.buysOften.length) ? user.buysOften.slice(0, 6).join(' ') : (trade + ' tools materials');
+      const query = 'specials sale this week ' + shops + ' ' + items + ' ' + region + ' Australia';
       const results = await searchWeb(query);
       if (!results || /unavailable|no search results|could not (parse|decode)/i.test(results)) continue;
 
@@ -1920,13 +2056,11 @@ setInterval(async function() {
       } catch (err) { console.error('Specials send failed:', err); }
     }
   } catch (err) { console.error('Specials scheduler error:', err); alertAdmin('specials scheduler', err); }
-}, 60 * 60 * 1000);
+}
 
-// 4) Morning weather report - checks every 15 min, fires once in the 5-7am local
-// window, once per day, opt-out via "stop weather". Runs for every onboarded user
-// regardless of activity. Funny weather-reporter style, with a next-day
-// heads-up folded into the same message when tomorrow looks extreme.
-setInterval(async function() {
+// 4) Morning weather report - fires once in the 5-7am local window, once per day,
+// opt-out via "stop weather". Runs for every onboarded user regardless of activity.
+async function schedWeatherMorning() {
   try {
     const snapshot = await db.collection('users')
       .where('onboarded', '==', true)
@@ -1961,12 +2095,11 @@ setInterval(async function() {
       } catch (err) { console.error('Weather send failed:', err); }
     }
   } catch (err) { console.error('Weather scheduler error:', err); alertAdmin('weather scheduler', err); }
-}, 15 * 60 * 1000);
+}
 
-// 5) Evening extreme-weather heads-up - hourly check, fires ~8pm local, once a
-// day, and ONLY when tomorrow is extreme (38C+ heat or 25mm+ rain). Shares the
-// "stop weather" opt-out with the morning report.
-setInterval(async function() {
+// 5) Evening extreme-weather heads-up - fires ~6-9pm local, once a day, and ONLY
+// when tomorrow is extreme (38C+ heat or 25mm+ rain). Shares "stop weather" opt-out.
+async function schedWeatherEvening() {
   try {
     const snapshot = await db.collection('users')
       .where('onboarded', '==', true)
@@ -1996,11 +2129,11 @@ setInterval(async function() {
       } catch (err) { console.error('Evening alert send failed:', err); }
     }
   } catch (err) { console.error('Evening alert scheduler error:', err); alertAdmin('evening weather scheduler', err); }
-}, 60 * 60 * 1000);
+}
 
-// 6) Tickets & compliance expiry warnings - hourly check, fires ~7am local once a
-// day. Warns at 30/14/7/1 days out and on/after expiry, once per threshold.
-setInterval(async function() {
+// 6) Tickets & compliance expiry warnings - fires ~7am local once a day. Warns at
+// 30/14/7/1 days out and on/after expiry, once per threshold.
+async function schedCompliance() {
   try {
     const snapshot = await db.collection('users')
       .where('onboarded', '==', true)
@@ -2049,11 +2182,11 @@ setInterval(async function() {
       }
     }
   } catch (err) { console.error('Compliance scheduler error:', err); alertAdmin('compliance scheduler', err); }
-}, 60 * 60 * 1000);
+}
 
-// 7) Weekly timesheet roundup to the boss - hourly check, fires Fri ~5pm local,
-// once a week. Compiles the week's hours per crew member into one short message.
-setInterval(async function() {
+// 7) Weekly timesheet roundup to the boss - fires on payDay ~5pm local, once a
+// week. Compiles the week's hours per crew member into one short message.
+async function schedTimesheet() {
   try {
     const snapshot = await db.collection('users')
       .where('onboarded', '==', true)
@@ -2079,7 +2212,34 @@ setInterval(async function() {
       } catch (err) { console.error('Weekly timesheet send failed:', err); }
     }
   } catch (err) { console.error('Timesheet summary scheduler error:', err); alertAdmin('timesheet scheduler', err); }
-}, 60 * 60 * 1000);
+}
+
+// Map used by the /cron/<job> endpoint (registered with the Express routes below).
+const CRON_JOBS = {
+  'reminders': schedReminders,
+  'proactive': schedProactive,
+  'specials': schedSpecials,
+  'weather-morning': schedWeatherMorning,
+  'weather-evening': schedWeatherEvening,
+  'compliance': schedCompliance,
+  'timesheets': schedTimesheet
+};
+
+// In-process timers. These run by default. Once you've wired an external cron to
+// the /cron endpoints, set SCHEDULERS_INTERNAL=false so jobs don't run in two
+// places at once. Leaving them on is safe but won't fire while the instance sleeps.
+if (SCHEDULERS_INTERNAL) {
+  setInterval(schedReminders, 60000);
+  setInterval(schedProactive, 60 * 60 * 1000);
+  setInterval(schedSpecials, 60 * 60 * 1000);
+  setInterval(schedWeatherMorning, 15 * 60 * 1000);
+  setInterval(schedWeatherEvening, 60 * 60 * 1000);
+  setInterval(schedCompliance, 60 * 60 * 1000);
+  setInterval(schedTimesheet, 60 * 60 * 1000);
+  console.log('Internal schedulers ON (set SCHEDULERS_INTERNAL=false once external cron is wired).');
+} else {
+  console.log('Internal schedulers OFF - expecting external cron to hit /cron/<job>.');
+}
 
 // ============================ SMS WEBHOOK ============================
 
@@ -2244,12 +2404,15 @@ app.post('/sms', async function(req, res) {
       user.signupAt = new Date().toISOString(); // starts the first-week getting-to-know-you clock
       // If signup didn't capture where they work, ask over SMS - we need it for
       // weather and anything location-based. The reply is captured next message.
-      if (!user.workAreas) user.awaitingWorkArea = true;
+      if (!user.state || !user.workAreas) user.awaitingWorkArea = true;
       await saveUser(userPhone, user);
       const hi = user.name ? ("Thanks " + user.name + " - ") : "Thanks - ";
       let doneMsg = hi + "that's everything sorted. I've got your back from here. Whenever something needs doing, just tell me and I'll keep you on track.";
       if (user.awaitingWorkArea) {
-        doneMsg += "\n\nOne quick thing - what area do you mainly work in? Helps me nail your weather and anything local.";
+        doneMsg += "\n\nOne quick thing - what state are you in, and what area or suburbs do you mainly work? (e.g. \"Geelong, VIC\"). Helps me nail your weather and anything local.";
+      }
+      if (!user.awaitingWorkArea) {
+        doneMsg += "\n\nWant me properly set up? Reply \"setup\" and I'll ask a few quick questions (couple of minutes). No rush - you can also just tell me things as we go.";
       }
       // Same-number dual-role: if they still clock in for a boss, remind them how.
       try {
@@ -2263,6 +2426,18 @@ app.post('/sms', async function(req, res) {
     }
 
     // ===================== ONBOARDED USER =====================
+
+    // MEMORY: log every inbound message to the rolling history NOW, before any
+    // command branch returns. Previously only the AI branch logged the inbound, so
+    // anything answered by a command handler was invisible to the next AI turn -
+    // a big reason Flow seemed to "forget" mid-conversation. Logging here means the
+    // whole conversation is on the record regardless of which branch replies.
+    if (userMessage) {
+      if (!Array.isArray(user.history)) user.history = [];
+      user.history.push({ role: 'user', content: userMessage });
+      if (user.history.length > 40) user.history = user.history.slice(-40);
+      try { await saveUser(userPhone, user); } catch (e) { console.error('Inbound history save failed:', e); }
+    }
 
     // Dual role: this number runs its own SiteFlow AND clocks in for an employer.
     // A clock-in for the employer must be explicitly marked ("clock on", "clock off",
@@ -2287,14 +2462,17 @@ app.post('/sms', async function(req, res) {
       }
     }
 
-    // Capture the work-area answer Flow asked for at signup-finish. One-shot, so
-    // we never nag: if the reply isn't a place, we drop the flag and let their
-    // message be handled normally below.
+    // Capture the work-area answer Flow asked for at signup-finish. Now grabs BOTH
+    // the state (timezone) and the work area (weather), from a reply like
+    // "Geelong, VIC". One-shot, so we never nag: if it's not a place, drop the flag
+    // and let the message be handled normally below.
     if (user.awaitingWorkArea) {
-      const area = looksLikeArea(userMessage);
-      user.awaitingWorkArea = false;
-      if (area) {
-        user.workAreas = area;
+      const parsed = parseStateAndArea(userMessage);
+      const area = parsed.area || looksLikeArea(userMessage);
+      if (parsed.state || area) {
+        user.awaitingWorkArea = false;
+        if (parsed.state) user.state = parsed.state;
+        if (area) user.workAreas = area;
         user.businessContext = buildBusinessContext(user);
         user.weatherGeo = null; // force a fresh geocode for the new area
         try {
@@ -2302,10 +2480,115 @@ app.post('/sms', async function(req, res) {
           if (geo) user.weatherGeo = geo;
         } catch (e) { console.error('Area geocode failed:', e); }
         await saveUser(userPhone, user);
-        twiml.message("Beauty - got you down for " + area + ". I'll use that for your weather and anything local.");
+        const where = [area, parsed.state].filter(Boolean).join(', ');
+        twiml.message("Beauty - got you down for " + (where || area || parsed.state) + ". I'll use that for your weather and anything local.");
         return reply();
       }
+      user.awaitingWorkArea = false;
       await saveUser(userPhone, user); // store the cleared flag, then fall through
+    }
+
+    // Capture a buy-list answer (Flow asked "what do you buy most often?"). One-shot.
+    if (user.awaitingBuyList) {
+      user.awaitingBuyList = false;
+      const items = parseCommaItems(userMessage);
+      if (items.length) {
+        if (!Array.isArray(user.buysOften)) user.buysOften = [];
+        items.forEach(function (it) {
+          if (!user.buysOften.some(function (x) { return x.toLowerCase() === it.toLowerCase(); })) user.buysOften.push(it);
+        });
+        if (user.buysOften.length > 30) user.buysOften = user.buysOften.slice(-30);
+        await saveUser(userPhone, user);
+        twiml.message("Good to know - I'll watch for specials on " + items.slice(0, 4).join(', ') + (items.length > 4 ? " and the rest" : "") + ".");
+        return reply();
+      }
+      await saveUser(userPhone, user); // not a list - clear flag, fall through
+    }
+
+    // ----- Guided setup walkthrough (opt-in: triggered by "setup") -----
+    // A light state machine over SETUP_ORDER. setupStep is 1-based while running
+    // (0 = not in setup). At each step we route the user's answer to the existing
+    // handlers below by NOT returning - except where we capture inline (name,
+    // location, hours). "skip" advances; "stop"/"cancel" exits.
+    {
+      const lc = userMessage.trim().toLowerCase();
+      const startSetup = /^(setup|set up|set me up|get set up|onboard me|walk me through)\b/.test(lc);
+      if (startSetup && !user.setupStep) {
+        const idx = nextSetupIndex(user, 0);
+        if (idx === -1) { twiml.message("You're already set up - I've got the basics. Just tell me things as we go and I'll remember them."); return reply(); }
+        user.setupStep = idx + 1;
+        await saveUser(userPhone, user);
+        twiml.message("Righto, let's get you set up. You can say \"skip\" to any question, or \"stop setup\" to bail.\n\n" + setupQuestion(SETUP_ORDER[idx]));
+        return reply();
+      }
+
+      if (user.setupStep && user.setupStep > 0) {
+        if (/^(stop|cancel|quit|exit|done|stop setup|cancel setup)\b/.test(lc)) {
+          user.setupStep = 0;
+          await saveUser(userPhone, user);
+          twiml.message("No worries, stopped setup. You can pick it back up anytime by saying \"setup\", or just tell me things as we go.");
+          return reply();
+        }
+
+        const curKey = SETUP_ORDER[user.setupStep - 1];
+        const skipping = /^(skip|next|nah|no|none|n\/a|not sure|later)\b/.test(lc);
+
+        if (!skipping) {
+          // Capture inline for the simple text answers; the richer ones (shops,
+          // crew, payday, review) fall through to the existing handlers below.
+          if (curKey === 'name') {
+            const nm = extractPersonName(userMessage) || userMessage.trim().split(/\s+/).slice(0, 2).join(' ');
+            if (nm) { user.name = nm; user.businessContext = buildBusinessContext(user); }
+          } else if (curKey === 'location') {
+            const parsed = parseStateAndArea(userMessage);
+            if (parsed.state) user.state = parsed.state;
+            if (parsed.area) user.workAreas = parsed.area;
+            user.businessContext = buildBusinessContext(user);
+            user.weatherGeo = null;
+            try { const geo = await geocodeForUser(user); if (geo) user.weatherGeo = geo; } catch (e) {}
+          } else if (curKey === 'trade') {
+            user.trade = userMessage.trim().slice(0, 40);
+            user.businessContext = buildBusinessContext(user);
+          } else if (curKey === 'hours') {
+            user.workHours = userMessage.trim().slice(0, 40);
+            user.finishTime = extractWorkHours(user.workHours);
+            user.businessContext = buildBusinessContext(user);
+          } else if (curKey === 'shops') {
+            const items = parseCommaItems(userMessage);
+            if (items.length) {
+              if (!Array.isArray(user.shops)) user.shops = [];
+              items.forEach(function (it) { if (!user.shops.some(function (x) { return x.toLowerCase() === it.toLowerCase(); })) user.shops.push(it); });
+            }
+          }
+          // crew / payday / review: leave the raw message to the dedicated handlers
+          // below (parseCrewAdd / parseTimesheetDay / parseReviewLink). We advance
+          // setup now and let those handlers send their own confirmation.
+        }
+
+        const nextIdx = nextSetupIndex(user, user.setupStep);
+        // For crew/payday/review we want the dedicated handler to run on THIS message,
+        // so only short-circuit-advance for the inline-captured keys or a skip.
+        const inlineKey = (curKey === 'name' || curKey === 'location' || curKey === 'trade' || curKey === 'hours' || curKey === 'shops');
+        if (skipping || inlineKey) {
+          if (nextIdx === -1) {
+            user.setupStep = 0;
+            await saveUser(userPhone, user);
+            twiml.message("That's you set up - nice one. I've got your basics on file now. Just talk to me normally from here and I'll keep track of the rest.");
+            return reply();
+          }
+          user.setupStep = nextIdx + 1;
+          await saveUser(userPhone, user);
+          twiml.message(setupQuestion(SETUP_ORDER[nextIdx]));
+          return reply();
+        }
+        // Not inline (crew/payday/review) and not skipping: advance the pointer,
+        // save, and DON'T return - fall through so the dedicated handler processes
+        // this message. We append the next question to that handler is messy, so we
+        // simply move the pointer and let the next inbound continue setup naturally.
+        user.setupStep = (nextIdx === -1) ? 0 : (nextIdx + 1);
+        await saveUser(userPhone, user);
+        // fall through to handlers below
+      }
     }
 
     // Flow asked for a name to finish saving a crew member or client.
@@ -2501,7 +2784,7 @@ app.post('/sms', async function(req, res) {
         if (!user.history) user.history = [];
         user.history.push({ role: 'user', content: '[Photo]' + (caption ? ': ' + caption : '') });
         user.history.push({ role: 'assistant', content: flowReply });
-        if (user.history.length > 30) user.history = user.history.slice(-30);
+        if (user.history.length > 40) user.history = user.history.slice(-40);
         await saveUser(userPhone, user);
 
         twiml.message(flowReply);
@@ -2572,6 +2855,7 @@ app.post('/sms', async function(req, res) {
 
       if (updated) {
         user.businessContext = buildBusinessContext(user);
+        user.weatherGeo = null;
         await saveUser(userPhone, user);
         twiml.message("Updated your " + updatedField + ".");
       } else {
@@ -2714,7 +2998,14 @@ app.post('/sms', async function(req, res) {
       else user.crew.push({ name: crewAdd.name, phone: crewAdd.phone });
       user.crewPhones = user.crew.map(function (c) { return c.phone; }).filter(Boolean);
       await saveUser(userPhone, user);
-      twiml.message("Added " + crewAdd.name + " to your crew (" + crewAdd.phone + "). Now you can say \"tell the crew ...\" and I'll message everyone at once. That's " + user.crew.length + " on the crew.");
+      // If this came in during guided setup, nudge to the next step.
+      let crewMsg = "Added " + crewAdd.name + " to your crew (" + crewAdd.phone + "). Now you can say \"tell the crew ...\" and I'll message everyone at once. That's " + user.crew.length + " on the crew.";
+      if (user.setupStep && user.setupStep > 0) {
+        const ni = nextSetupIndex(user, user.setupStep - 0);
+        if (ni === -1) { user.setupStep = 0; await saveUser(userPhone, user); crewMsg += "\n\nThat's you set up - nice one."; }
+        else { user.setupStep = ni + 1; await saveUser(userPhone, user); crewMsg += "\n\n" + setupQuestion(SETUP_ORDER[ni]); }
+      }
+      twiml.message(crewMsg);
       return reply();
     }
 
@@ -2858,7 +3149,13 @@ app.post('/sms', async function(req, res) {
       if (link) {
         user.reviewLink = link;
         await saveUser(userPhone, user);
-        twiml.message("Saved your review link. When you mark a job done (e.g. \"Sarah's job is done\"), I'll offer to ask that client for a Google review.");
+        let rmsg = "Saved your review link. When you mark a job done (e.g. \"Sarah's job is done\"), I'll offer to ask that client for a Google review.";
+        if (user.setupStep && user.setupStep > 0) {
+          const ni = nextSetupIndex(user, user.setupStep);
+          if (ni === -1) { user.setupStep = 0; await saveUser(userPhone, user); rmsg += "\n\nThat's you fully set up - beauty."; }
+          else { user.setupStep = ni + 1; await saveUser(userPhone, user); rmsg += "\n\n" + setupQuestion(SETUP_ORDER[ni]); }
+        }
+        twiml.message(rmsg);
         return reply();
       }
     }
@@ -2933,7 +3230,13 @@ app.post('/sms', async function(req, res) {
       if (payDay) {
         user.payDay = payDay;
         await saveUser(userPhone, user);
-        twiml.message("Done - I'll send you the week's timesheets every " + (DAY_LONG[payDay] || payDay) + " at 5pm, with everyone's hours up to then in the one message.");
+        let pmsg = "Done - I'll send you the week's timesheets every " + (DAY_LONG[payDay] || payDay) + " at 5pm, with everyone's hours up to then in the one message.";
+        if (user.setupStep && user.setupStep > 0) {
+          const ni = nextSetupIndex(user, user.setupStep);
+          if (ni === -1) { user.setupStep = 0; await saveUser(userPhone, user); pmsg += "\n\nThat's you set up - nice one."; }
+          else { user.setupStep = ni + 1; await saveUser(userPhone, user); pmsg += "\n\n" + setupQuestion(SETUP_ORDER[ni]); }
+        }
+        twiml.message(pmsg);
         return reply();
       }
     }
@@ -3138,9 +3441,10 @@ app.post('/sms', async function(req, res) {
       return reply();
     }
 
-    if (!user.history) user.history = [];
-    user.history.push({ role: 'user', content: userMessage });
-    if (user.history.length > 30) { user.history = user.history.slice(-30); }
+    // The inbound message was already pushed to history at the top of the onboarded
+    // section (central logging), so we do NOT re-push it here - that previously
+    // created duplicate entries. Just make sure the array exists.
+    if (!Array.isArray(user.history)) user.history = [];
 
     // Keyword match instead of an OpenAI classifier call (halves per-message cost).
     const shouldSearch = SEARCH_KEYWORDS.some(function(k) {
@@ -3197,7 +3501,7 @@ app.post('/sms', async function(req, res) {
       ? "\nThis user has connected Xero. You CAN see their invoices and money owed - if they ask about cash, invoices, or who owes them, that is handled live elsewhere, so just answer naturally and never say you can't access their accounts."
       : "\nThis user has NOT connected Xero yet. If they ask about invoices or money owed, tell them you can pull it from Xero once it's connected and that they can text 'connect Xero' to set it up.";
 
-    const systemPrompt = "You are Flow, an AI assistant built specifically for Australian construction business owners.\n\nVOICE:\n- You are their assistant, not a customer-service bot. Talk like a sharp, easy-going offsider who knows the business - warm, natural, a bit of personality. Speak freely and conversationally; you don't have to keep every reply clipped.\n- Just answer. Get to the point, do the thing, say what's done. Sound like a capable person who's on it.\n- Vary how you reply. Never lean on the same stock phrase, and always put things in your own words. Acknowledge what they actually said.\n- NEVER end a message with a generic offer of help. Do not sign off with lines like 'Anything else I can help with?', 'Let me know if you need anything', 'Happy to help with whatever else', or any variation. Once you've answered, stop - a real assistant doesn't tack a service-desk question onto every text. Only ask a follow-up when there's a genuine, specific reason to (a missing detail, a real next step), not as filler.\n- Don't over-explain or pad. No corporate fluff, no robotic phrasing, no needless preamble like 'Sure, I can help with that'.\n- Match their energy. If they're brief, be brief; if they're chatting, you can chat back.\n- Never mention ChatGPT or OpenAI. Always refer to yourself as Flow.\n- Never say you cannot access the internet.\n- You CAN give them the weather and forecast for their work area - when they ask, real forecast figures are provided to you. Give them the actual numbers (temps, rain chance, wind) in your own words. NEVER tell them to check BOM, Weather.com, an app or any other site - that is your job, not theirs.\n- Australian spelling and dollars.\n- Always use the user's work areas and state for location based questions.\n- You know their regular suppliers and their biggest admin headache. Reference suppliers by name when ordering or prices come up, and look for natural chances to ease that admin pain.\n\nGETTING TASKS RIGHT (this is critical - getting it exactly right matters far more than being quick):\n- Before you act on ANY task, make sure you have every detail you'd need to do it exactly the way they want. If there's any meaningful uncertainty, anything missing, or anything that could be done more than one way, ASK before you do it. When in doubt, ask - it is always better to ask one more question than to get it wrong or only half right.\n- Don't assume, and don't fill gaps with your best guess. The only things you can take as given are details they've already told you or that are in their profile.\n- Ask EVERY question you need to nail the task - but group them all into ONE message so they can answer in one go. Never drip-feed questions one at a time across several texts.\n- For example: a reminder needs the exact time, the date if it isn't today, and who it involves; chasing a quote needs which job, who the client is, the amount, and the tone or wording they want; a job ad needs the role, area, pay, hours, start date, and how to apply; placing or chasing an order needs the item, quantity, supplier, and when it's needed by.\n- After they answer, read the key details back in plain English and only then do the task - so they get the chance to correct you before it's done.\n- To actually SAVE a crew member or a client, you need their mobile number. If they ask you to add someone and you can't see a number in their message, ASK for it - never say you've added someone when you haven't.\n- Be curious about their business and complete the picture fast. If they give you half of something - a number with no name, a client with no job, a person with no role, a supplier with no category, a job with no address - ask the ONE quick question that fills the gap, then save it. One short question, never an interrogation. The better you understand their business, the more useful you are to them.\n- ALWAYS reply with a real, human sentence. Never reply with only hidden tags - even when you're just noting something down, say something natural back.\n\nWhen search results are provided you MUST use them.\n\nFor each reminder with a clear time, confirm briefly then add it on its OWN new line: REMINDER: [task] | [time]. If they ask for several reminders in one message, output a separate REMINDER: line for every one.\n\nFor something they need to DO but with no specific time, add it to their to-do list on its OWN new line: TODO: [task] (one line per task). Use REMINDER for timed things and TODO for untimed tasks - never both for the same item. Still reply with a natural sentence; the TODO line is stripped before they see it.\n\nIf the user asks for something you genuinely cannot do, respond warmly in one or two sentences, tell them it is not a current feature, then add on its OWN new line exactly:\nFEATURE_REQUEST: [what they asked for]\n\nAs you chat, quietly learn about the business. When you learn something genuinely new (not already listed below), add it on its OWN new line at the very end of your reply using these tags - do not repeat a tag for something already known:\nLEARN_TEAM: [name] | [role]\nLEARN_SUPPLIER: [name] | [category]\nLEARN_CLIENT: [name] | [notes]\nLEARN_NOTE: [fact]\nLEARN_LEAD: [job or client] | [detail]\nUse LEARN_LEAD when they mention a possible job, enquiry, or quote that hasn't been won yet (e.g. someone asked them to price a job). Also: when they tell you their name or what to call them, add on its own line LEARN_NAME: [name]. These tags are stripped before the user sees the message, so keep them off the lines the user reads.\n\nWhen the user mentions a person's name you don't recognise from the team list, after completing their request ask: 'Is [name] part of your team? I can keep track of them for you.'\n\nUser profile: " + user.businessContext + teamContext + knowledgeContext + summarizeForContext(user) + integrationsContext + "\nName: " + user.name + "\nState: " + user.state + "\nWork areas: " + user.workAreas + "\nWork hours: " + user.workHours + "\nFinish time: " + user.finishTime + "\nRegular suppliers: " + user.suppliers + "\nBiggest admin headache: " + user.adminHeadache + "\nLocal time: " + new Date().toLocaleString('en-AU', { timeZone: userTz }) + searchContext;
+    const systemPrompt = "You are Flow, an AI assistant built specifically for Australian construction business owners.\n\nVOICE:\n- You are their assistant, not a customer-service bot. Talk like a sharp, easy-going offsider who knows the business - warm, natural, a bit of personality. Speak freely and conversationally; you don't have to keep every reply clipped.\n- Just answer. Get to the point, do the thing, say what's done. Sound like a capable person who's on it.\n- Vary how you reply. Never lean on the same stock phrase, and always put things in your own words. Acknowledge what they actually said.\n- NEVER end a message with a generic offer of help. Do not sign off with lines like 'Anything else I can help with?', 'Let me know if you need anything', 'Happy to help with whatever else', or any variation. Once you've answered, stop - a real assistant doesn't tack a service-desk question onto every text. Only ask a follow-up when there's a genuine, specific reason to (a missing detail, a real next step), not as filler.\n- Don't over-explain or pad. No corporate fluff, no robotic phrasing, no needless preamble like 'Sure, I can help with that'.\n- Match their energy. If they're brief, be brief; if they're chatting, you can chat back.\n- Never mention ChatGPT or OpenAI. Always refer to yourself as Flow.\n- Never say you cannot access the internet.\n- You have a PERSISTENT memory of this business. Their profile, crew, clients, suppliers, tickets, to-do list, saved notes, the shops they use, and your recent conversation are all stored and loaded every time they text you - you DO remember between conversations. NEVER tell them you can't remember once a chat ends, that you only keep context for the current chat, or that they'll need to repeat details next time - that is false and makes you look broken. If you genuinely don't have one specific detail on file, just ask for that one thing.\n- When a task needs several details (an invoice, a quote, an order), work out everything you're missing and ask for it in ONE message - then remember what they give you. NEVER ask again for a detail they've already given you earlier in the conversation; it's all in the history above, so use it.\n- You CAN give them the weather and forecast for their work area - when they ask, real forecast figures are provided to you. Give them the actual numbers (temps, rain chance, wind) in your own words. NEVER tell them to check BOM, Weather.com, an app or any other site - that is your job, not theirs.\n- Australian spelling and dollars.\n- Always use the user's work areas and state for location based questions.\n- You know their regular suppliers and their biggest admin headache. Reference suppliers by name when ordering or prices come up, and look for natural chances to ease that admin pain.\n\nGETTING TASKS RIGHT (this is critical - getting it exactly right matters far more than being quick):\n- Before you act on ANY task, make sure you have every detail you'd need to do it exactly the way they want. If there's any meaningful uncertainty, anything missing, or anything that could be done more than one way, ASK before you do it. When in doubt, ask - it is always better to ask one more question than to get it wrong or only half right.\n- Don't assume, and don't fill gaps with your best guess. The only things you can take as given are details they've already told you or that are in their profile.\n- Ask EVERY question you need to nail the task - but group them all into ONE message so they can answer in one go. Never drip-feed questions one at a time across several texts, and never re-ask something already answered.\n- For example: a reminder needs the exact time, the date if it isn't today, and who it involves; chasing a quote needs which job, who the client is, the amount, and the tone or wording they want; a job ad needs the role, area, pay, hours, start date, and how to apply; placing or chasing an order needs the item, quantity, supplier, and when it's needed by.\n- After they answer, read the key details back in plain English and only then do the task - so they get the chance to correct you before it's done.\n- To actually SAVE a crew member or a client, you need their mobile number. If they ask you to add someone and you can't see a number in their message, ASK for it - never say you've added someone when you haven't.\n- Be curious about their business and complete the picture fast. If they give you half of something - a number with no name, a client with no job, a person with no role, a supplier with no category, a job with no address - ask the ONE quick question that fills the gap, then save it. One short question, never an interrogation. The better you understand their business, the more useful you are to them.\n- ALWAYS reply with a real, human sentence. Never reply with only hidden tags - even when you're just noting something down, say something natural back.\n\nWhen search results are provided you MUST use them.\n\nFor each reminder with a clear time, confirm briefly then add it on its OWN new line: REMINDER: [task] | [time]. If they ask for several reminders in one message, output a separate REMINDER: line for every one.\n\nFor something they need to DO but with no specific time, add it to their to-do list on its OWN new line: TODO: [task] (one line per task). Use REMINDER for timed things and TODO for untimed tasks - never both for the same item. Still reply with a natural sentence; the TODO line is stripped before they see it.\n\nIf the user asks for something you genuinely cannot do, respond warmly in one or two sentences, tell them it is not a current feature, then add on its OWN new line exactly:\nFEATURE_REQUEST: [what they asked for]\n\nAs you chat, quietly learn about the business. When you learn something genuinely new (not already listed below), add it on its OWN new line at the very end of your reply using these tags - do not repeat a tag for something already known:\nLEARN_TEAM: [name] | [role]\nLEARN_SUPPLIER: [name] | [category]\nLEARN_CLIENT: [name] | [notes]\nLEARN_NOTE: [fact]\nLEARN_LEAD: [job or client] | [detail]\nUse LEARN_LEAD when they mention a possible job, enquiry, or quote that hasn't been won yet (e.g. someone asked them to price a job). Also: when they tell you their name or what to call them, add on its own line LEARN_NAME: [name]. These tags are stripped before the user sees the message, so keep them off the lines the user reads.\n\nWhen the user mentions a person's name you don't recognise from the team list, after completing their request ask: 'Is [name] part of your team? I can keep track of them for you.'\n\nUser profile: " + user.businessContext + teamContext + knowledgeContext + summarizeForContext(user) + integrationsContext + "\nName: " + user.name + "\nState: " + user.state + "\nWork areas: " + user.workAreas + "\nWork hours: " + user.workHours + "\nFinish time: " + user.finishTime + "\nRegular suppliers: " + user.suppliers + "\nBiggest admin headache: " + user.adminHeadache + "\nLocal time: " + new Date().toLocaleString('en-AU', { timeZone: userTz }) + searchContext;
 
     const [response, extractedFacts] = await Promise.all([
       openai.chat.completions.create({
@@ -3324,6 +3628,7 @@ app.post('/sms', async function(req, res) {
     }
 
     user.history.push({ role: 'assistant', content: flowReply });
+    if (user.history.length > 40) user.history = user.history.slice(-40);
     await saveUser(userPhone, user);
     twiml.message(flowReply);
 
@@ -3425,6 +3730,30 @@ app.get('/callback/xero', async function(req, res) {
   } catch (err) {
     console.error('callback/xero error:', err);
     res.status(500).send('Could not finish connecting Xero. Please try the link again.');
+  }
+});
+
+// ---- External cron endpoint (makes Flow genuinely 24/7) ---------------------
+// An external scheduler (Render Cron, cron-job.org, UptimeRobot, etc.) hits
+//   GET /cron/<job>?key=<CRON_SECRET>
+// to run a scheduled job even while the instance would otherwise be idle/asleep.
+// Guarded by CRON_SECRET: if it's unset, or the key doesn't match, we return 403
+// and run nothing. <job> must be one of the keys in CRON_JOBS.
+app.get('/cron/:job', async function(req, res) {
+  try {
+    if (!CRON_SECRET || (req.query.key || '').toString() !== CRON_SECRET) {
+      res.status(403).send('Forbidden');
+      return;
+    }
+    const jobName = (req.params.job || '').toString();
+    const job = CRON_JOBS[jobName];
+    if (!job) { res.status(404).send('Unknown job'); return; }
+    // Kick it off; don't make the cron service wait on the whole run.
+    res.status(200).send('ok: ' + jobName);
+    try { await job(); } catch (e) { console.error('Cron job failed (' + jobName + '):', e); }
+  } catch (err) {
+    console.error('cron endpoint error:', err);
+    if (!res.headersSent) res.status(500).send('error');
   }
 });
 
