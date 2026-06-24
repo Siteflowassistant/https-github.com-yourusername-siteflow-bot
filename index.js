@@ -3757,6 +3757,230 @@ app.get('/cron/:job', async function(req, res) {
   }
 });
 
+// ============================================================================
+//  SALES BOT  -  "Flow the salesperson" for the website widget + Instagram DMs.
+//  Self-contained: reuses the app, openai, db, twilioClient and ADMIN_PHONE
+//  already defined above. Paste this whole block in JUST BEFORE the
+//  `const PORT = ...; app.listen(...)` lines at the very bottom of index.js.
+//
+//  Set these in Render -> Environment (the widget works with just the first one;
+//  the other three are only needed for Instagram):
+//    WIDGET_ALLOWED_ORIGIN = https://siteflowassistant.com
+//    IG_VERIFY_TOKEN       = (any random string you choose)
+//    IG_PAGE_TOKEN         = (from your Meta app)
+//    META_APP_SECRET       = (from your Meta app)
+// ============================================================================
+(function () {
+  const signupUrl = 'https://siteflowassistant.com';
+  const allowedOrigin = process.env.WIDGET_ALLOWED_ORIGIN || 'https://siteflowassistant.com';
+  const fromNumber = process.env.TWILIO_PHONE_NUMBER;
+  const igVerifyToken = process.env.IG_VERIFY_TOKEN || '';
+  const igPageToken = process.env.IG_PAGE_TOKEN || '';
+  const metaAppSecret = process.env.META_APP_SECRET || '';
+
+  const SALES_PROMPT =
+    "You are Flow - the AI assistant behind SiteFlow, and right now you're the salesperson. " +
+    "You're talking to someone who landed on the website or DMed the SiteFlow Instagram. Your ONE job is to turn this chat into a signup. " +
+    "You are NOT the full product here; you're the friendly, switched-on offsider who sells it.\n\n" +
+    "WHO YOU'RE TALKING TO: Australian tradies and small construction business owners - builders, chippies, sparkies, plumbers, concreters, painters. Busy, practical, allergic to corporate wank.\n\n" +
+    "WHAT SITEFLOW IS (say it simply): an AI assistant for tradies that lives in text messages. No app to download, no login - you just text Flow like a mate and he handles the admin. He sets reminders, chases invoices, sends client updates, builds crew timesheets, gives you a morning brief and the weather, tracks ticket/licence expiries, and learns your business the more you use him. The pitch: he's the team member you never have to train, available 24/7, who never forgets.\n\n" +
+    "THE CORE PAIN you sell against: tradies run the whole business from memory, and one forgotten invoice or missed follow-up can cost thousands. Flow is the fix.\n\n" +
+    "PRICING (these are the real numbers - never invent others):\n" +
+    "- Solo: $49 AUD/month - sole traders / owner-operators. All core features, reminders, web search.\n" +
+    "- Business: $99 AUD/month - small teams up to 5. Adds team features and priority support.\n" +
+    "- Enterprise: custom pricing - larger outfits, white-label, dedicated support.\n" +
+    "EARLY-ACCESS OFFER (genuine, use it to create urgency): the first 50 subscribers get 3 months free. Spots are limited.\n\n" +
+    "HOW TO SELL (be genuinely good, not pushy):\n" +
+    "- Open by finding out their trade and their biggest admin headache. People buy when they feel understood.\n" +
+    "- Then tie Flow directly to THAT pain in their words - don't reel off a feature list.\n" +
+    "- Handle objections straight: 'another app?' -> there's no app, it's just texting. 'Too dear?' -> one invoice you forgot to send costs more than a month of Flow. 'Will it work for my trade?' -> yes, he learns how YOUR business runs. 'Is my data safe?' -> yes, it's private to your business and never shared.\n" +
+    "- Always be moving toward ONE call to action: start at " + signupUrl + ", OR leave your name and mobile and we'll get you set up and lock in your early-access spot.\n" +
+    "- Keep messages SHORT and texty - a couple of sentences. Australian spelling and slang. Warm, confident, never robotic. Match their energy.\n\n" +
+    "HONESTY RULES (do not break these):\n" +
+    "- NEVER invent features, integrations, prices, stats, or customer names/case studies. If you're not certain something is a real, current feature, say you'll have the founder confirm rather than promise it.\n" +
+    "- Don't give financial, legal, or tax advice.\n" +
+    "- If they ask something you genuinely can't answer, be honest and offer to have Daniel (the founder) follow up - then ask for their number.\n" +
+    "- Never claim a signup happened. You capture details; the founder closes the loop.\n\n" +
+    "LEAD CAPTURE (this is how you 'win'): the moment you have their NAME and an Australian MOBILE number, put this on its OWN line at the very end of your reply (it is stripped before they see it, so still write a normal friendly message above it):\n" +
+    "LEAD: [name] | [mobile] | [trade and what they're after]\n" +
+    "Only emit a LEAD line when you actually have a real mobile number. If you have only one of name/number, ask for the other naturally.";
+
+  function buildMessages(history, channel) {
+    const sys = SALES_PROMPT + (channel === 'instagram'
+      ? "\n\nCHANNEL: Instagram DM - keep replies extra short and casual, like a real DM."
+      : "\n\nCHANNEL: website chat widget - concise, helpful, conversion-focused.");
+    const trimmed = (Array.isArray(history) ? history : [])
+      .filter(function (m) { return m && (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string'; })
+      .slice(-24)
+      .map(function (m) { return { role: m.role, content: m.content.slice(0, 1500) }; });
+    return [{ role: 'system', content: sys }].concat(trimmed);
+  }
+
+  async function handleSalesLead(rawLeadLine, channel, contactRef) {
+    try {
+      const parts = rawLeadLine.split('|').map(function (s) { return s.trim(); });
+      const lead = {
+        name: parts[0] || '', mobile: parts[1] || '', note: parts[2] || '',
+        channel: channel, contactRef: contactRef || '', createdAt: new Date().toISOString()
+      };
+      try { await db.collection('sales_leads').add(lead); }
+      catch (e) { console.error('Lead save failed:', e); }
+      if (ADMIN_PHONE && fromNumber) {
+        try {
+          await twilioClient.messages.create({
+            body: "New SiteFlow lead (" + channel + "): " + (lead.name || 'no name') +
+                  " " + (lead.mobile || '') + (lead.note ? (" - " + lead.note) : ""),
+            from: fromNumber, to: ADMIN_PHONE
+          });
+        } catch (e) { console.error('Lead alert SMS failed:', e); }
+      }
+      return lead;
+    } catch (e) { console.error('handleSalesLead failed:', e); return null; }
+  }
+
+  async function salesReply(history, channel, contactRef) {
+    let raw = '';
+    try {
+      const resp = await openai.chat.completions.create({
+        model: 'gpt-4o-mini',
+        max_tokens: channel === 'instagram' ? 160 : 240,
+        temperature: 0.7,
+        messages: buildMessages(history, channel)
+      });
+      raw = (resp.choices[0].message.content || '').trim();
+    } catch (e) {
+      console.error('Sales LLM failed:', e);
+      return { reply: "Bit of a glitch my end - try that again in a sec, or jump straight to " + signupUrl + " and I'll get you sorted.", lead: null };
+    }
+    let lead = null;
+    const keep = [];
+    const lines = raw.split('\n');
+    for (let i = 0; i < lines.length; i++) {
+      const m = lines[i].trim().match(/^LEAD:\s*(.+)$/i);
+      if (m) { const c = await handleSalesLead(m[1], channel, contactRef); if (c) lead = c; }
+      else keep.push(lines[i]);
+    }
+    let reply = keep.join('\n').trim();
+    if (!reply) reply = "Happy to help you get set up - what trade are you in?";
+    return { reply: reply, lead: lead };
+  }
+
+  // Public, unauthenticated endpoint -> basic in-memory rate limit (~20 / 5 min).
+  const salesHits = {};
+  function salesRateLimited(key) {
+    const now = Date.now(), windowMs = 5 * 60 * 1000;
+    const arr = (salesHits[key] || []).filter(function (t) { return now - t < windowMs; });
+    arr.push(now); salesHits[key] = arr;
+    if (Math.random() < 0.02) {
+      Object.keys(salesHits).forEach(function (k) {
+        salesHits[k] = salesHits[k].filter(function (t) { return now - t < windowMs; });
+        if (!salesHits[k].length) delete salesHits[k];
+      });
+    }
+    return arr.length > 20;
+  }
+
+  function setSalesCors(res) {
+    res.set('Access-Control-Allow-Origin', allowedOrigin);
+    res.set('Vary', 'Origin');
+    res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
+    res.set('Access-Control-Allow-Headers', 'Content-Type');
+  }
+
+  app.options('/chat', function (req, res) { setSalesCors(res); res.sendStatus(204); });
+
+  app.post('/chat', express.json({ limit: '32kb' }), async function (req, res) {
+    setSalesCors(res);
+    try {
+      const ip = (req.headers['x-forwarded-for'] || req.ip || 'unknown').toString().split(',')[0].trim();
+      if (salesRateLimited('chat:' + ip)) {
+        res.status(429).json({ reply: "You're firing fast! Give it a moment, or just head to " + signupUrl + " to get started." });
+        return;
+      }
+      const messages = (req.body && req.body.messages) || [];
+      if (!Array.isArray(messages) || messages.length === 0) {
+        res.status(400).json({ reply: "G'day! What trade are you in, and what's the biggest admin headache I can take off your plate?" });
+        return;
+      }
+      const out = await salesReply(messages, 'website', 'web:' + ip);
+      res.json({ reply: out.reply, leadCaptured: !!out.lead });
+    } catch (err) {
+      console.error('/chat error:', err);
+      res.status(500).json({ reply: "Something went sideways my end - try again shortly, or head to " + signupUrl + "." });
+    }
+  });
+
+  // ---- Instagram DMs ----
+  async function loadIgThread(psid) {
+    try {
+      const doc = await db.collection('ig_threads').doc(psid).get();
+      return doc.exists && Array.isArray(doc.data().history) ? doc.data().history : [];
+    } catch (e) { return []; }
+  }
+  async function saveIgThread(psid, history) {
+    try { await db.collection('ig_threads').doc(psid).set({ history: history.slice(-20), updatedAt: new Date().toISOString() }); }
+    catch (e) { console.error('IG thread save failed:', e); }
+  }
+  async function sendIg(psid, text) {
+    if (!igPageToken) { console.error('IG_PAGE_TOKEN not set - cannot reply'); return; }
+    try {
+      const resp = await fetch('https://graph.facebook.com/v21.0/me/messages?access_token=' + encodeURIComponent(igPageToken), {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ recipient: { id: psid }, message: { text: text } })
+      });
+      if (!resp.ok) console.error('IG send failed:', resp.status, await resp.text());
+    } catch (e) { console.error('IG send error:', e); }
+  }
+
+  app.get('/webhook/instagram', function (req, res) {
+    const mode = req.query['hub.mode'];
+    const token = req.query['hub.verify_token'];
+    const challenge = req.query['hub.challenge'];
+    if (mode === 'subscribe' && igVerifyToken && token === igVerifyToken) res.status(200).send(challenge);
+    else res.sendStatus(403);
+  });
+
+  app.post('/webhook/instagram',
+    express.json({ verify: function (req, res, buf) { req.rawBody = buf; } }),
+    async function (req, res) {
+      try {
+        if (metaAppSecret) {
+          const sig = (req.headers['x-hub-signature-256'] || '').toString();
+          const expected = 'sha256=' + crypto.createHmac('sha256', metaAppSecret)
+            .update(req.rawBody || Buffer.from('')).digest('hex');
+          if (sig.length !== expected.length ||
+              !crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) { res.sendStatus(403); return; }
+        }
+      } catch (e) { res.sendStatus(403); return; }
+
+      res.sendStatus(200); // ack fast, then process
+
+      try {
+        const entries = Array.isArray(req.body && req.body.entry) ? req.body.entry : [];
+        for (const entry of entries) {
+          const events = Array.isArray(entry.messaging) ? entry.messaging : [];
+          for (const ev of events) {
+            if (!ev || !ev.message || ev.message.is_echo) continue;
+            const psid = ev.sender && ev.sender.id;
+            const text = ev.message.text;
+            if (!psid || !text) continue;
+            if (salesRateLimited('ig:' + psid)) continue;
+            const history = await loadIgThread(psid);
+            history.push({ role: 'user', content: text });
+            const out = await salesReply(history, 'instagram', 'ig:' + psid);
+            history.push({ role: 'assistant', content: out.reply });
+            await saveIgThread(psid, history);
+            await sendIg(psid, out.reply);
+          }
+        }
+      } catch (err) { console.error('IG webhook processing error:', err); }
+    }
+  );
+
+  console.log('Sales bot mounted: POST /chat (widget), GET/POST /webhook/instagram (IG DMs).');
+})();
+
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, function() {
   console.log("Flow is live on port " + PORT);
