@@ -48,6 +48,15 @@ async function alertAdmin(label, err) {
 process.on('uncaughtException', function (e) { console.error('uncaughtException:', e); alertAdmin('crash (uncaught exception)', e); });
 process.on('unhandledRejection', function (e) { console.error('unhandledRejection:', e); alertAdmin('crash (unhandled promise)', e); });
 
+// Redact a phone number for logging - keeps just enough (last 3 digits) to eyeball
+// traffic patterns in Render's logs without ever printing a client's or tradie's
+// real mobile number to stdout.
+function logPhone(phone) {
+  const p = (phone || '').toString();
+  if (p.length <= 3) return '***';
+  return '***' + p.slice(-3);
+}
+
 // Public URL of Flow's photo, sent during onboarding so the user can save it as
 // the contact picture. Set this in your environment (see the setup guide).
 const FLOW_PHOTO_URL = process.env.FLOW_PHOTO_URL;
@@ -84,12 +93,80 @@ const XERO_SCOPES = 'openid profile email offline_access accounting.transactions
 const SCHEDULERS_INTERNAL = process.env.SCHEDULERS_INTERNAL !== 'false';
 const CRON_SECRET = process.env.CRON_SECRET || '';
 
+// ===== /sms webhook security =====
+
+// The exact public URL Twilio POSTs to for the SMS webhook. Pinned explicitly
+// rather than reconstructed from req.protocol/req.headers.host, because Render
+// sits behind a proxy - the request Express sees is not necessarily the exact
+// URL Twilio signed. Twilio's signature is only valid against the literal
+// webhook URL configured in the Twilio console, so this MUST match that exactly
+// (path included). Override with TWILIO_SMS_WEBHOOK_URL if the webhook URL ever
+// differs from APP_BASE_URL + '/sms'.
+const TWILIO_SMS_WEBHOOK_URL = process.env.TWILIO_SMS_WEBHOOK_URL || (APP_BASE_URL + '/sms');
+
+// Verify an inbound /sms POST actually came from Twilio, via the x-twilio-signature
+// header (HMAC-SHA1 of the webhook URL + sorted POST params, keyed with the Twilio
+// auth token). WITHOUT this, anyone can POST a fake `From` number to /sms and fully
+// impersonate any tradie - read their reminders, message their clients/crew as them,
+// even reach their connected Xero data, since the app has no other notion of
+// "logged in" besides the phone number Twilio reports. Fails CLOSED (rejects) on a
+// missing/invalid signature. Fails OPEN only when TWILIO_AUTH_TOKEN itself isn't
+// configured - which would already mean sending/replying is broken - so a momentarily
+// unset env var doesn't fully brick the bot; this should never be the case in
+// production and is logged loudly if it happens.
+function isValidTwilioRequest(req) {
+  // EMERGENCY BYPASS ONLY: if the pinned TWILIO_SMS_WEBHOOK_URL doesn't exactly
+  // match what's configured in the Twilio console, valid requests would start
+  // getting rejected and Flow would go silent. If that happens, set
+  // TWILIO_SIGNATURE_CHECK_DISABLED=true in Render to restore service while you
+  // fix the URL, then REMOVE the env var immediately - this logs loudly every
+  // single request while it's on so it can't be forgotten.
+  if (process.env.TWILIO_SIGNATURE_CHECK_DISABLED === 'true') {
+    console.error('WARNING: Twilio signature check is DISABLED via TWILIO_SIGNATURE_CHECK_DISABLED - remove this env var as soon as the underlying issue is fixed.');
+    return true;
+  }
+  const authToken = process.env.TWILIO_AUTH_TOKEN;
+  if (!authToken) {
+    console.error('TWILIO_AUTH_TOKEN not set - cannot verify inbound SMS signature; allowing through (fail-open). Fix this immediately.');
+    return true;
+  }
+  const signature = req.headers['x-twilio-signature'];
+  if (!signature) return false;
+  try {
+    return twilio.validateRequest(authToken, signature, TWILIO_SMS_WEBHOOK_URL, req.body || {});
+  } catch (e) {
+    console.error('Twilio signature validation error:', e);
+    return false;
+  }
+}
+
+// Per-number rate limit on inbound SMS. The sales widget (/chat) already had one;
+// the core /sms path - the one actually wired to real tradie accounts, Xero data,
+// and OpenAI calls - didn't, so a scripted flood from one number could rack up
+// cost or hammer a single account. Sliding 60s window, ~15 msgs/min per number -
+// generous for a genuine back-and-forth, tight enough to stop abuse.
+const _smsHits = {};
+function isSmsRateLimited(phone) {
+  const now = Date.now();
+  const windowMs = 60 * 1000;
+  const arr = (_smsHits[phone] || []).filter(function (t) { return now - t < windowMs; });
+  arr.push(now);
+  _smsHits[phone] = arr;
+  if (Math.random() < 0.01) { // occasional cleanup so the map doesn't grow forever
+    Object.keys(_smsHits).forEach(function (k) {
+      _smsHits[k] = _smsHits[k].filter(function (t) { return now - t < windowMs; });
+      if (!_smsHits[k].length) delete _smsHits[k];
+    });
+  }
+  return arr.length > 15;
+}
+
 /* =============================================================================
  * DEFERRED - NOT BUILT YET (kept here so we remember; each is isolated to add)
  *  Security (do before any real public exposure):
- *   - Twilio webhook signature verification on /sms  [HIGHEST priority]
- *   - Per-number rate limiting on /sms
- *   - Stop logging full message text + phone numbers to stdout
+ *   - [DONE] Twilio webhook signature verification on /sms
+ *   - [DONE] Per-number rate limiting on /sms
+ *   - [DONE] Stop logging full message text + phone numbers to stdout
  *   - Encrypt Xero refresh tokens at rest (currently plaintext in Firestore)
  *  Reliability / scale:
  *   - Wire external cron to the /cron endpoints + set SCHEDULERS_INTERNAL=false
@@ -1995,7 +2072,7 @@ async function schedProactive() {
           to: phone
         });
         await db.collection('users').doc(phone).update(upd);
-        console.log("Proactive sent to: " + phone);
+        console.log("Proactive sent to: " + logPhone(phone));
       } catch (err) { console.error("Proactive failed:", err); }
     }
   } catch (err) { console.error("Proactive scheduler error:", err); alertAdmin('proactive scheduler', err); }
@@ -2052,7 +2129,7 @@ async function schedSpecials() {
       try {
         await twilioClient.messages.create({ body: body, from: process.env.TWILIO_PHONE_NUMBER, to: phone });
         await db.collection('users').doc(phone).update({ lastSpecialsAt: new Date().toISOString() });
-        console.log("Specials sent to: " + phone);
+        console.log("Specials sent to: " + logPhone(phone));
       } catch (err) { console.error('Specials send failed:', err); }
     }
   } catch (err) { console.error('Specials scheduler error:', err); alertAdmin('specials scheduler', err); }
@@ -2091,7 +2168,7 @@ async function schedWeatherMorning() {
         const upd = { lastWeatherAt: new Date().toISOString(), weatherIntroSent: true };
         if (result.geo) upd.weatherGeo = result.geo; // cache the geocode lookup
         await db.collection('users').doc(phone).update(upd);
-        console.log("Weather sent to: " + phone);
+        console.log("Weather sent to: " + logPhone(phone));
       } catch (err) { console.error('Weather send failed:', err); }
     }
   } catch (err) { console.error('Weather scheduler error:', err); alertAdmin('weather scheduler', err); }
@@ -2125,7 +2202,7 @@ async function schedWeatherEvening() {
         const upd = { lastWeatherEveningAt: new Date().toISOString() };
         if (result.geo) upd.weatherGeo = result.geo; // cache the geocode lookup
         await db.collection('users').doc(phone).update(upd);
-        console.log("Evening weather alert sent to: " + phone);
+        console.log("Evening weather alert sent to: " + logPhone(phone));
       } catch (err) { console.error('Evening alert send failed:', err); }
     }
   } catch (err) { console.error('Evening alert scheduler error:', err); alertAdmin('evening weather scheduler', err); }
@@ -2172,7 +2249,7 @@ async function schedCompliance() {
           await twilioClient.messages.create({ body: body, from: process.env.TWILIO_PHONE_NUMBER, to: phone });
           item.warned.push(level);
           changed = true;
-          console.log("Compliance warning sent to " + phone + ": " + item.label);
+          console.log("Compliance warning sent to " + logPhone(phone) + ": " + item.label);
         } catch (err) { console.error('Compliance warning failed:', err); }
       }
 
@@ -2208,7 +2285,7 @@ async function schedTimesheet() {
       try {
         await twilioClient.messages.create({ body: "Here's the week's timesheets:\n\n" + msg, from: process.env.TWILIO_PHONE_NUMBER, to: phone });
         await db.collection('users').doc(phone).update({ lastTimesheetSummaryAt: new Date().toISOString() });
-        console.log("Weekly timesheet sent to: " + phone);
+        console.log("Weekly timesheet sent to: " + logPhone(phone));
       } catch (err) { console.error('Weekly timesheet send failed:', err); }
     }
   } catch (err) { console.error('Timesheet summary scheduler error:', err); alertAdmin('timesheet scheduler', err); }
@@ -2252,10 +2329,21 @@ app.post('/sms', async function(req, res) {
   }
 
   try {
+    // SECURITY: reject anything that isn't a genuinely signed Twilio request
+    // BEFORE touching any user data. Without this, the `From` field - the ONLY
+    // thing this app uses to decide "who is this" - can be spoofed by anyone
+    // who can POST to this URL, which would let them impersonate any tradie.
+    if (!isValidTwilioRequest(req)) {
+      console.error('Rejected /sms POST with invalid/missing Twilio signature from IP ' + ((req.headers['x-forwarded-for'] || req.ip || 'unknown').toString().split(',')[0].trim()));
+      res.status(403).send('Forbidden');
+      return;
+    }
+
     const userMessage = ((req.body && req.body.Body) || '').trim();
     const userPhone = (req.body && req.body.From) || '';
 
-    console.log("Incoming from: " + userPhone + " message: " + userMessage);
+    // Redacted - never log full phone numbers or message content to stdout.
+    console.log("Incoming SMS from " + logPhone(userPhone) + " (" + userMessage.length + " chars)");
 
     if (!userPhone) {
       twiml.message("Missing sender.");
@@ -2271,6 +2359,15 @@ app.post('/sms', async function(req, res) {
       twiml.message("I'm really glad you reached out" + nm + ". I'm only an assistant, so I can't give you the support you deserve right now - but people who can are there 24/7. Call Lifeline on 13 11 14, or 000 if you're in immediate danger. You can also reach Beyond Blue on 1300 22 4636. You don't have to carry this on your own.");
       try { await db.collection('crisis_events').add({ phone: userPhone, createdAt: admin.firestore.Timestamp.now() }); }
       catch (e) { console.error('Crisis log failed:', e); }
+      return reply();
+    }
+
+    // SECURITY: per-number rate limit. Placed after the crisis check (that reply
+    // must never be throttled) but before everything else, so a flood from one
+    // number can't run up OpenAI/Twilio cost or hammer a single account.
+    if (isSmsRateLimited(userPhone)) {
+      console.error('SMS rate limit hit for ' + logPhone(userPhone));
+      twiml.message("Getting a lot of messages in a row from you - give it a few seconds and try again.");
       return reply();
     }
 
@@ -3050,7 +3147,7 @@ app.post('/sms', async function(req, res) {
         try {
           await twilioClient.messages.create({ body: fromName + broadcastContent, from: process.env.TWILIO_PHONE_NUMBER, to: member.phone });
           sent++;
-        } catch (err) { console.error('Crew broadcast failed to ' + member.phone + ':', err); }
+        } catch (err) { console.error('Crew broadcast failed to ' + logPhone(member.phone) + ':', err); }
       }
       twiml.message("Sent to " + sent + " of " + crew.length + " crew:\n\"" + broadcastContent + "\"");
       return reply();
@@ -3480,7 +3577,7 @@ app.post('/sms', async function(req, res) {
           searchContext = '\n\nSEARCH RESULTS - you must use these to answer:\n' + searchResults;
         }
       } else {
-        console.log('Searching: ' + userMessage + ' Australia');
+        console.log('Searching (general query, ' + userMessage.length + ' chars)');
         const searchResults = await searchWeb(userMessage + ' Australia');
         searchContext = '\n\nSEARCH RESULTS - you must use these to answer:\n' + searchResults;
       }
